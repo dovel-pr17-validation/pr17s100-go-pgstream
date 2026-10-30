@@ -1,0 +1,254 @@
+// SPDX-License-Identifier: Apache-2.0
+
+package search
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"runtime/debug"
+
+	loglib "github.com/xataio/pgstream/pkg/log"
+	"github.com/xataio/pgstream/pkg/otel"
+	"github.com/xataio/pgstream/pkg/wal"
+	"github.com/xataio/pgstream/pkg/wal/checkpointer"
+	"github.com/xataio/pgstream/pkg/wal/processor"
+	"github.com/xataio/pgstream/pkg/wal/processor/batch"
+	"github.com/xataio/pgstream/pkg/wal/replication"
+)
+
+// BatchIndexer is the environment for ingesting the WAL logical
+// replication events into a search store using the pgstream flow
+type BatchIndexer struct {
+	store       Store
+	adapter     walAdapter
+	logger      loglib.Logger
+	batchSender batchSender
+
+	skipSchema func(schemaName string) bool
+
+	// checkpoint callback to mark what was safely stored
+	checkpoint checkpointer.Checkpoint
+
+	// dropped accumulates what ignore_send_errors has discarded, and is shared
+	// with the sender so the totals and metrics cover this indexer.
+	dropped         *batch.DroppedCounter
+	instrumentation *otel.Instrumentation
+}
+
+type Option func(*BatchIndexer)
+
+type batchSender interface {
+	SendMessage(context.Context, *batch.WALMessage[*msg]) error
+	Close() error
+}
+
+// NewBatchIndexer returns a processor of wal events that indexes data into the
+// search store provided on input.
+func NewBatchIndexer(ctx context.Context, config IndexerConfig, store Store, lsnParser replication.LSNParser, opts ...Option) (*BatchIndexer, error) {
+	indexer := &BatchIndexer{
+		store:  store,
+		logger: loglib.NewNoopLogger(),
+		// by default all schemas are processed
+		skipSchema: func(string) bool { return false },
+	}
+
+	for _, opt := range opts {
+		opt(indexer)
+	}
+
+	var idHasher IDHasher
+	if config.HashDocIDs {
+		idHasher = DefaultIDHasher()
+	}
+	indexer.adapter = newAdapter(store.GetMapper(), lsnParser, idHasher)
+
+	var err error
+	indexer.dropped = batch.NewDroppedCounter()
+	if config.Batch.IgnoreSendErrors {
+		indexer.logger.Warn(nil, "ignore_send_errors is enabled: batches that fail to send will be dropped and the run will continue", loglib.Fields{
+			"posture":     "at_risk",
+			"writer_type": searchIndexerType,
+		})
+	}
+	if err := indexer.dropped.RegisterMetrics(indexer.instrumentation, searchIndexerType); err != nil {
+		return nil, fmt.Errorf("initialising search batch indexer metrics: %w", err)
+	}
+
+	indexer.batchSender, err = batch.NewSender(ctx, &config.Batch, indexer.sendBatch, indexer.logger,
+		batch.WithDroppedCounter[*msg](indexer.dropped))
+	if err != nil {
+		return nil, err
+	}
+
+	return indexer, nil
+}
+
+const searchIndexerType = "search_batch_indexer"
+
+// WithInstrumentation exports the indexer's dropped-batch counters. The store is
+// instrumented separately; this covers what the batch sender discards.
+func WithInstrumentation(i *otel.Instrumentation) Option {
+	return func(indexer *BatchIndexer) {
+		indexer.instrumentation = i
+	}
+}
+
+func WithLogger(l loglib.Logger) Option {
+	return func(i *BatchIndexer) {
+		i.logger = loglib.NewLogger(l).WithFields(loglib.Fields{
+			loglib.ModuleField: "search_batch_indexer",
+		})
+	}
+}
+
+func WithCheckpoint(c checkpointer.Checkpoint) Option {
+	return func(i *BatchIndexer) {
+		i.checkpoint = c
+	}
+}
+
+// ProcessWALEvent is responsible for sending the wal event to the search
+// store and committing the event position. It can be called concurrently.
+func (i *BatchIndexer) ProcessWALEvent(ctx context.Context, event *wal.Event) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			i.logger.Panic("[PANIC] Panic while processing replication event", loglib.Fields{
+				"wal_data":    event.Data,
+				"panic":       r,
+				"stack_trace": debug.Stack(),
+			})
+			err = fmt.Errorf("search batch indexer: %w: %v", processor.ErrPanic, r)
+		}
+	}()
+
+	if i.logger.IsTraceEnabled() {
+		i.logger.Trace("search batch indexer: received wal event", loglib.Fields{
+			"wal_data":            event.Data,
+			"wal_commit_position": event.CommitPosition,
+		})
+	}
+
+	msg, err := i.adapter.walEventToMsg(event)
+	if err != nil {
+		if errors.Is(err, errNilIDValue) || errors.Is(err, errMetadataMissing) {
+			i.logger.Warn(err, "search batch indexer: invalid event, skipping message")
+			return nil
+		}
+		return fmt.Errorf("wal data to queue item: %w", err)
+	}
+
+	if msg == nil {
+		return nil
+	}
+
+	return i.batchSender.SendMessage(ctx, batch.NewWALMessage(msg, event.CommitPosition))
+}
+
+func (i *BatchIndexer) Name() string {
+	return "search-batch-indexer"
+}
+
+func (i *BatchIndexer) Close() error {
+	err := i.batchSender.Close()
+	i.dropped.LogTotals(i.logger)
+	return err
+}
+
+func (i *BatchIndexer) sendBatch(ctx context.Context, batch *batch.Batch[*msg]) error {
+	// we'll mostly process writes, so pre-allocate the "max" amount
+	writes := make([]Document, 0, len(batch.GetMessages()))
+	flushWrites := func() error {
+		if len(writes) > 0 {
+			failed, err := i.store.SendDocuments(ctx, writes)
+			if err != nil {
+				i.logger.Error(err, "search store error when sending documents", loglib.Fields{
+					"documents": writes,
+				})
+				if !errors.Is(err, ErrInvalidQuery) {
+					return err
+				}
+			}
+			if len(failed) > 0 {
+				i.logger.Error(nil, "failed to send documents", loglib.Fields{
+					"failed_documents": failed,
+				})
+			}
+			writes = writes[:0]
+		}
+		return nil
+	}
+
+	for _, msg := range batch.GetMessages() {
+		switch {
+		case msg == nil:
+			// ignore
+		case msg.write != nil:
+			writes = append(writes, *msg.write)
+		case msg.schemaDiff != nil:
+			if err := flushWrites(); err != nil {
+				return err
+			}
+			if err := i.applySchemaDiff(ctx, msg.schemaDiff); err != nil {
+				if errors.Is(err, context.Canceled) {
+					return err
+				}
+				i.logger.Error(err, "search batch indexer", loglib.Fields{
+					"severity": "DATALOSS",
+					"diff":     msg.schemaDiff,
+				})
+				return nil
+			}
+		case msg.truncate != nil:
+			if err := flushWrites(); err != nil {
+				return err
+			}
+			if err := i.truncateTable(ctx, msg.truncate); err != nil {
+				return err
+			}
+		default:
+			return errEmptyQueueMsg
+		}
+	}
+
+	if err := flushWrites(); err != nil {
+		return err
+	}
+
+	if i.checkpoint != nil {
+		if err := i.checkpoint(ctx, batch.GetCommitPositions()); err != nil {
+			return fmt.Errorf("checkpointing positions: %w", err)
+		}
+	}
+
+	return nil
+}
+
+func (i *BatchIndexer) truncateTable(ctx context.Context, item *truncateItem) error {
+	return i.store.DeleteTableDocuments(ctx, item.schemaName, []string{item.tableID})
+}
+
+func (i *BatchIndexer) applySchemaDiff(ctx context.Context, diff *wal.SchemaDiff) error {
+	// schema is filtered out, nothing to do
+	if i.skipSchema(diff.SchemaName) {
+		i.logger.Info("search batch indexer: apply schema diff: skipping schema", loglib.Fields{"schema_name": diff.SchemaName})
+		return nil
+	}
+
+	if diff.SchemaDropped {
+		if err := i.store.DeleteSchema(ctx, diff.SchemaName); err != nil {
+			return fmt.Errorf("deleting schema: %w", err)
+		}
+		return nil
+	}
+
+	i.logger.Info("search batch indexer: apply schema diff", loglib.Fields{
+		"diff": diff,
+	})
+
+	if err := i.store.ApplySchemaDiff(ctx, diff); err != nil {
+		return fmt.Errorf("applying schema diff: %w", err)
+	}
+
+	return nil
+}

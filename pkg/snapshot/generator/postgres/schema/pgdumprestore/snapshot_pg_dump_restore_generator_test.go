@@ -1,0 +1,3159 @@
+// SPDX-License-Identifier: Apache-2.0
+
+package pgdumprestore
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"os"
+	"slices"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/require"
+	pglib "github.com/xataio/pgstream/internal/postgres"
+	"github.com/xataio/pgstream/internal/postgres/mocks"
+	"github.com/xataio/pgstream/pkg/backoff"
+	"github.com/xataio/pgstream/pkg/log"
+	"github.com/xataio/pgstream/pkg/snapshot"
+	"github.com/xataio/pgstream/pkg/snapshot/generator"
+	generatormocks "github.com/xataio/pgstream/pkg/snapshot/generator/mocks"
+)
+
+func TestSnapshotGenerator_CreateSnapshot(t *testing.T) {
+	t.Parallel()
+
+	schemaDump := []byte("schema dump\nCREATE SEQUENCE test.test_sequence\nALTER TABLE public.test_table OWNER TO test_role;\nGRANT ALL ON TABLE public.test_table TO test_role2;\nCREATE INDEX a;\n")
+	schemaDumpWithViews := []byte("schema dump\nCREATE SEQUENCE test.test_sequence\nALTER TABLE public.test_table OWNER TO test_role;\nGRANT ALL ON TABLE public.test_table TO test_role2;\nCREATE VIEW public.test_view AS\n SELECT 1;\nCREATE INDEX a;\n")
+	schemaDumpNoSequences := []byte("schema dump\nALTER TABLE public.test_table OWNER TO test_role;\nGRANT ALL ON TABLE public.test_table TO test_role2;\nCREATE INDEX a;\n")
+	filteredDumpNoSequences := []byte("schema dump\nGRANT ALL ON SCHEMA \"public\" TO \"test_role\";\nALTER TABLE public.test_table OWNER TO test_role;\nGRANT ALL ON TABLE public.test_table TO test_role2;\n")
+	filteredDump := []byte("schema dump\nCREATE SEQUENCE test.test_sequence\nGRANT ALL ON SCHEMA \"public\" TO \"test_role\";\nALTER TABLE public.test_table OWNER TO test_role;\nGRANT ALL ON TABLE public.test_table TO test_role2;\n")
+	sequenceDump := []byte("sequence dump\n")
+	indexDump := []byte("CREATE INDEX a;\n\n")
+	testViewsDump := []byte("CREATE VIEW public.test_view AS\n SELECT 1;\n\n")
+	rolesDumpOriginal := []byte("roles dump\nCREATE ROLE postgres\nCREATE ROLE test_role\nCREATE ROLE test_role2\nALTER ROLE test_role3 INHERIT FROM test_role;\n")
+	rolesDumpFiltered := []byte("roles dump\nCREATE ROLE test_role\nCREATE ROLE test_role2\nGRANT \"test_role\" TO CURRENT_USER;\n")
+	cleanupDump := []byte("cleanup dump\n")
+	testSchema := "test_schema"
+	quotedTestSchema := `"test_schema"`
+	testTable := "test_table"
+	excludedTable := "excluded_test_table"
+	excludedTable2 := "excluded_test_table_2"
+	excludedSchema := "excluded_test_schema"
+	excludedSchemas := []string{pglib.QuoteIdentifier(excludedSchema), "pg_temp_*", "pg_toast_temp_*"}
+	pgstreamExcludedSchemas := []string{`"pgstream"`, "pg_temp_*", "pg_toast_temp_*"}
+	errTest := errors.New("oh noes")
+	testSequence := pglib.QuoteQualifiedIdentifier("test", "test_sequence")
+	testRole := "test_role"
+	schemaCreateDump := fmt.Appendf(nil, "CREATE SCHEMA IF NOT EXISTS %s;\n", quotedTestSchema)
+
+	fullDumpRestoreFn := func(_ context.Context, i uint, po pglib.PGRestoreOptions, dump []byte) (string, error) {
+		require.Equal(t, pglib.PGRestoreOptions{
+			ConnectionString: "target-url",
+			Format:           "p",
+		}, po)
+		switch i {
+		case 1:
+			require.Equal(t, string(schemaCreateDump), string(dump))
+		case 2:
+			require.Equal(t, string(rolesDumpFiltered), string(dump))
+		case 3:
+			require.Equal(t, string(filteredDump), string(dump))
+		case 4:
+			require.Equal(t, string(sequenceDump), string(dump))
+		case 5:
+			require.Equal(t, string(indexDump), string(dump))
+		default:
+			return "", fmt.Errorf("unexpected call to pgrestoreFn: %d", i)
+		}
+		return "", nil
+	}
+
+	fullDumpNoSchemaCreateRestoreFn := func(_ context.Context, i uint, po pglib.PGRestoreOptions, dump []byte) (string, error) {
+		require.Equal(t, pglib.PGRestoreOptions{
+			ConnectionString: "target-url",
+			Format:           "p",
+		}, po)
+		switch i {
+		case 1:
+			require.Equal(t, string(rolesDumpFiltered), string(dump))
+		case 2:
+			require.Equal(t, string(filteredDump), string(dump))
+		case 3:
+			require.Equal(t, string(sequenceDump), string(dump))
+		case 4:
+			require.Equal(t, string(indexDump), string(dump))
+		default:
+			return "", fmt.Errorf("unexpected call to pgrestoreFn: %d", i)
+		}
+		return "", nil
+	}
+
+	testCapturedColumns := map[string]map[string][]string{
+		testSchema: {testTable: {"id"}},
+	}
+
+	tableColumnsRows := func() *mocks.Rows {
+		return &mocks.Rows{
+			CloseFn: func() {},
+			NextFn:  func(i uint) bool { return i == 1 },
+			ScanFn: func(i uint, dest ...any) error {
+				require.Len(t, dest, 3)
+				schemaName, ok := dest[0].(*string)
+				require.True(t, ok)
+				*schemaName = testSchema
+				tableName, ok := dest[1].(*string)
+				require.True(t, ok)
+				*tableName = testTable
+				columnName, ok := dest[2].(*string)
+				require.True(t, ok)
+				*columnName = "id"
+				return nil
+			},
+			ErrFn: func() error { return nil },
+		}
+	}
+
+	validQuerier := func() *mocks.Querier {
+		return &mocks.Querier{
+			ExecFn: func(ctx context.Context, i uint, query string, args ...any) (pglib.CommandTag, error) {
+				require.Equal(t, "CREATE SCHEMA IF NOT EXISTS "+quotedTestSchema, query)
+				return pglib.CommandTag{}, nil
+			},
+			QueryFn: func(ctx context.Context, _ uint, query string, args ...any) (pglib.Rows, error) {
+				switch query {
+				case pglib.DiscoverTableColumnsQuery:
+					require.Equal(t, []any{[]string{testSchema}, []string{testTable}}, args)
+					return tableColumnsRows(), nil
+				case selectSchemasQuery:
+					require.Equal(t, []any{[]string{testSchema}}, args)
+					return &mocks.Rows{
+						CloseFn: func() {},
+						NextFn:  func(i uint) bool { return i == 1 },
+						ScanFn: func(i uint, dest ...any) error {
+							require.Len(t, dest, 1)
+							schemaName, ok := dest[0].(*string)
+							require.True(t, ok)
+							*schemaName = excludedSchema
+							return nil
+						},
+						ErrFn: func() error { return nil },
+					}, nil
+				case selectSchemaTablesQuery:
+					require.Equal(t, []any{testSchema, []string{testTable}}, args)
+					return &mocks.Rows{
+						CloseFn: func() {},
+						NextFn:  func(i uint) bool { return i == 1 },
+						ScanFn: func(i uint, dest ...any) error {
+							require.Len(t, dest, 2)
+							schemaName, ok := dest[0].(*string)
+							require.True(t, ok)
+							*schemaName = excludedSchema
+							tableName, ok := dest[1].(*string)
+							require.True(t, ok)
+							*tableName = excludedTable
+							return nil
+						},
+						ErrFn: func() error { return nil },
+					}, nil
+				case selectTablesQuery:
+					require.Equal(t, []any{[]string{testTable}}, args)
+					return &mocks.Rows{
+						CloseFn: func() {},
+						NextFn:  func(i uint) bool { return i == 1 },
+						ScanFn: func(i uint, dest ...any) error {
+							require.Len(t, dest, 2)
+							schemaName, ok := dest[0].(*string)
+							require.True(t, ok)
+							*schemaName = excludedSchema
+							tableName, ok := dest[1].(*string)
+							require.True(t, ok)
+							*tableName = excludedTable
+							return nil
+						},
+						ErrFn: func() error { return nil },
+					}, nil
+				default:
+					return nil, fmt.Errorf("unexpected query: %s", query)
+				}
+			},
+		}
+	}
+
+	tests := []struct {
+		name              string
+		snapshot          *snapshot.Snapshot
+		conn              pglib.Querier
+		pgdumpFn          pglib.PGDumpFn
+		pgdumpallFn       pglib.PGDumpAllFn
+		pgrestoreFn       pglib.PGRestoreFn
+		generator         generator.SnapshotGenerator
+		role              string
+		noOwner           bool
+		noPrivileges      bool
+		rolesSnapshotMode string
+		cleanTargetDB     bool
+		snapshotTracker   snapshotProgressTracker
+
+		wantErr error
+	}{
+		{
+			name: "ok",
+			snapshot: &snapshot.Snapshot{
+				SchemaTables: map[string][]string{
+					testSchema: {testTable},
+				},
+			},
+			conn: validQuerier(),
+			pgdumpFn: newMockPgdump(func(_ context.Context, i uint, po pglib.PGDumpOptions) ([]byte, error) {
+				switch i {
+				case 1:
+					require.Equal(t, pglib.PGDumpOptions{
+						ConnectionString: "source-url",
+						Format:           "p",
+						SchemaOnly:       true,
+						ExcludeSchemas:   excludedSchemas,
+						ExcludeTables:    []string{pglib.QuoteQualifiedIdentifier(excludedSchema, excludedTable)},
+						Role:             testRole,
+						NoOwner:          true,
+						NoPrivileges:     true,
+					}, po)
+					return schemaDump, nil
+
+				case 2:
+					require.Equal(t, pglib.PGDumpOptions{
+						ConnectionString: "source-url",
+						Format:           "p",
+						DataOnly:         true,
+						Tables:           []string{testSequence},
+					}, po)
+					return sequenceDump, nil
+				default:
+					return nil, fmt.Errorf("unexpected call to pgdumpFn: %d", i)
+				}
+			}),
+			pgdumpallFn: newMockPgdumpall(func(_ context.Context, i uint, po pglib.PGDumpAllOptions) ([]byte, error) {
+				switch i {
+				case 1:
+					require.Equal(t, pglib.PGDumpAllOptions{
+						ConnectionString: "source-url",
+						RolesOnly:        true,
+						Role:             testRole,
+						NoOwner:          true,
+						NoPrivileges:     true,
+					}, po)
+					return rolesDumpOriginal, nil
+				default:
+					return nil, fmt.Errorf("unexpected call to pgdumpallFn: %d", i)
+				}
+			}),
+			pgrestoreFn:  newMockPgrestore(fullDumpRestoreFn),
+			role:         testRole,
+			noOwner:      true,
+			noPrivileges: true,
+
+			wantErr: nil,
+		},
+		{
+			name: "ok - with tracking",
+			snapshot: &snapshot.Snapshot{
+				SchemaTables: map[string][]string{
+					testSchema: {testTable},
+				},
+			},
+			conn: validQuerier(),
+			pgdumpFn: newMockPgdump(func(_ context.Context, i uint, po pglib.PGDumpOptions) ([]byte, error) {
+				switch i {
+				case 1:
+					require.Equal(t, pglib.PGDumpOptions{
+						ConnectionString: "source-url",
+						Format:           "p",
+						SchemaOnly:       true,
+						ExcludeSchemas:   excludedSchemas,
+						ExcludeTables:    []string{pglib.QuoteQualifiedIdentifier(excludedSchema, excludedTable)},
+						Role:             testRole,
+						NoOwner:          true,
+						NoPrivileges:     true,
+					}, po)
+					return schemaDump, nil
+
+				case 2:
+					require.Equal(t, pglib.PGDumpOptions{
+						ConnectionString: "source-url",
+						Format:           "p",
+						DataOnly:         true,
+						Tables:           []string{testSequence},
+					}, po)
+					return sequenceDump, nil
+				default:
+					return nil, fmt.Errorf("unexpected call to pgdumpFn: %d", i)
+				}
+			}),
+			pgdumpallFn: newMockPgdumpall(func(_ context.Context, i uint, po pglib.PGDumpAllOptions) ([]byte, error) {
+				switch i {
+				case 1:
+					require.Equal(t, pglib.PGDumpAllOptions{
+						ConnectionString: "source-url",
+						RolesOnly:        true,
+						Role:             testRole,
+						NoOwner:          true,
+						NoPrivileges:     true,
+					}, po)
+					return rolesDumpOriginal, nil
+				default:
+					return nil, fmt.Errorf("unexpected call to pgdumpallFn: %d", i)
+				}
+			}),
+			pgrestoreFn:  newMockPgrestore(fullDumpRestoreFn),
+			role:         testRole,
+			noOwner:      true,
+			noPrivileges: true,
+			snapshotTracker: &mockSnapshotTracker{
+				trackIndexesCreationFn: func(ctx context.Context) {},
+			},
+
+			wantErr: nil,
+		},
+		{
+			name: "ok - with views",
+			snapshot: &snapshot.Snapshot{
+				SchemaTables: map[string][]string{
+					testSchema: {testTable},
+				},
+			},
+			conn: validQuerier(),
+			pgdumpFn: newMockPgdump(func(_ context.Context, i uint, po pglib.PGDumpOptions) ([]byte, error) {
+				switch i {
+				case 1:
+					return schemaDumpWithViews, nil
+				case 2:
+					return sequenceDump, nil
+				default:
+					return nil, fmt.Errorf("unexpected call to pgdumpFn: %d", i)
+				}
+			}),
+			pgdumpallFn: newMockPgdumpall(func(_ context.Context, i uint, po pglib.PGDumpAllOptions) ([]byte, error) {
+				switch i {
+				case 1:
+					return rolesDumpOriginal, nil
+				default:
+					return nil, fmt.Errorf("unexpected call to pgdumpallFn: %d", i)
+				}
+			}),
+			pgrestoreFn: newMockPgrestore(func(_ context.Context, i uint, po pglib.PGRestoreOptions, dump []byte) (string, error) {
+				switch i {
+				case 1:
+					require.Equal(t, string(schemaCreateDump), string(dump))
+				case 2:
+					require.Equal(t, string(rolesDumpFiltered), string(dump))
+				case 3:
+					require.Equal(t, string(filteredDump), string(dump))
+				case 4:
+					require.Equal(t, string(sequenceDump), string(dump))
+				case 5:
+					require.Equal(t, string(indexDump), string(dump))
+				case 6:
+					require.Equal(t, string(testViewsDump), string(dump))
+				default:
+					return "", fmt.Errorf("unexpected call to pgrestoreFn: %d", i)
+				}
+				return "", nil
+			}),
+
+			wantErr: nil,
+		},
+		{
+			name: "ok - no sequence dump",
+			snapshot: &snapshot.Snapshot{
+				SchemaTables: map[string][]string{
+					testSchema: {testTable},
+				},
+			},
+			conn: validQuerier(),
+			pgdumpFn: newMockPgdump(func(_ context.Context, i uint, po pglib.PGDumpOptions) ([]byte, error) {
+				switch i {
+				case 1:
+					require.Equal(t, pglib.PGDumpOptions{
+						ConnectionString: "source-url",
+						Format:           "p",
+						SchemaOnly:       true,
+						ExcludeSchemas:   excludedSchemas,
+						ExcludeTables:    []string{pglib.QuoteQualifiedIdentifier(excludedSchema, excludedTable)},
+					}, po)
+					return schemaDumpNoSequences, nil
+				default:
+					return nil, fmt.Errorf("unexpected call to pgdumpFn: %d", i)
+				}
+			}),
+			pgdumpallFn: newMockPgdumpall(func(_ context.Context, i uint, po pglib.PGDumpAllOptions) ([]byte, error) {
+				switch i {
+				case 1:
+					require.Equal(t, pglib.PGDumpAllOptions{
+						ConnectionString: "source-url",
+						RolesOnly:        true,
+					}, po)
+					return rolesDumpOriginal, nil
+				default:
+					return nil, fmt.Errorf("unexpected call to pgdumpallFn: %d", i)
+				}
+			}),
+			pgrestoreFn: newMockPgrestore(func(_ context.Context, i uint, po pglib.PGRestoreOptions, dump []byte) (string, error) {
+				require.Equal(t, pglib.PGRestoreOptions{
+					ConnectionString: "target-url",
+					Format:           "p",
+				}, po)
+				switch i {
+				case 1:
+					require.Equal(t, string(schemaCreateDump), string(dump))
+				case 2:
+					require.Equal(t, string(rolesDumpFiltered), string(dump))
+				case 3:
+					require.Equal(t, string(filteredDumpNoSequences), string(dump))
+				case 4:
+					require.Equal(t, string(indexDump), string(dump))
+				default:
+					return "", fmt.Errorf("unexpected call to pgrestoreFn: %d", i)
+				}
+				return "", nil
+			}),
+
+			wantErr: nil,
+		},
+		{
+			name: "ok - with generator",
+			snapshot: &snapshot.Snapshot{
+				SchemaTables: map[string][]string{
+					testSchema: {testTable},
+				},
+			},
+			conn: validQuerier(),
+			pgdumpFn: newMockPgdump(func(_ context.Context, i uint, po pglib.PGDumpOptions) ([]byte, error) {
+				switch i {
+				case 1:
+					require.Equal(t, pglib.PGDumpOptions{
+						ConnectionString: "source-url",
+						Format:           "p",
+						SchemaOnly:       true,
+						ExcludeSchemas:   excludedSchemas,
+						ExcludeTables:    []string{pglib.QuoteQualifiedIdentifier(excludedSchema, excludedTable)},
+					}, po)
+					return schemaDump, nil
+				case 2:
+					require.Equal(t, pglib.PGDumpOptions{
+						ConnectionString: "source-url",
+						Format:           "p",
+						DataOnly:         true,
+						Tables:           []string{testSequence},
+					}, po)
+					return sequenceDump, nil
+				default:
+					return nil, fmt.Errorf("unexpected call to pgdumpFn: %d", i)
+				}
+			}),
+			pgdumpallFn: newMockPgdumpall(func(_ context.Context, i uint, po pglib.PGDumpAllOptions) ([]byte, error) {
+				switch i {
+				case 1:
+					require.Equal(t, pglib.PGDumpAllOptions{
+						ConnectionString: "source-url",
+						RolesOnly:        true,
+					}, po)
+					return rolesDumpOriginal, nil
+				default:
+					return nil, fmt.Errorf("unexpected call to pgdumpallFn: %d", i)
+				}
+			}),
+			pgrestoreFn: newMockPgrestore(fullDumpRestoreFn),
+
+			generator: &generatormocks.Generator{
+				CreateSnapshotFn: func(ctx context.Context, ss *snapshot.Snapshot) error {
+					require.Equal(t, &snapshot.Snapshot{
+						SchemaTables: map[string][]string{
+							testSchema: {testTable},
+						},
+						TableColumns: testCapturedColumns,
+					}, ss)
+					return nil
+				},
+			},
+
+			wantErr: nil,
+		},
+		{
+			name: "ok - with schema-only tables and generator",
+			snapshot: &snapshot.Snapshot{
+				SchemaTables: map[string][]string{
+					testSchema: {testTable},
+				},
+				SchemaOnlyTables: map[string][]string{
+					testSchema: {"schema_only_table"},
+				},
+			},
+			conn: &mocks.Querier{
+				QueryFn: func(ctx context.Context, _ uint, query string, args ...any) (pglib.Rows, error) {
+					switch query {
+					case pglib.DiscoverTableColumnsQuery:
+						return tableColumnsRows(), nil
+					case selectSchemasQuery:
+						require.Equal(t, []any{[]string{testSchema}}, args)
+						return &mocks.Rows{
+							CloseFn: func() {},
+							NextFn:  func(i uint) bool { return i == 1 },
+							ScanFn: func(i uint, dest ...any) error {
+								require.Len(t, dest, 1)
+								schemaName, ok := dest[0].(*string)
+								require.True(t, ok)
+								*schemaName = excludedSchema
+								return nil
+							},
+							ErrFn: func() error { return nil },
+						}, nil
+					case selectSchemaTablesQuery:
+						// the schema-only tables are part of the dump scope
+						require.Equal(t, []any{testSchema, []string{testTable, "schema_only_table"}}, args)
+						return &mocks.Rows{
+							CloseFn: func() {},
+							NextFn:  func(i uint) bool { return i == 1 },
+							ScanFn: func(i uint, dest ...any) error {
+								require.Len(t, dest, 2)
+								schemaName, ok := dest[0].(*string)
+								require.True(t, ok)
+								*schemaName = excludedSchema
+								tableName, ok := dest[1].(*string)
+								require.True(t, ok)
+								*tableName = excludedTable
+								return nil
+							},
+							ErrFn: func() error { return nil },
+						}, nil
+					default:
+						return nil, fmt.Errorf("unexpected query: %s", query)
+					}
+				},
+			},
+			pgdumpFn: newMockPgdump(func(_ context.Context, i uint, po pglib.PGDumpOptions) ([]byte, error) {
+				switch i {
+				case 1:
+					require.Equal(t, pglib.PGDumpOptions{
+						ConnectionString: "source-url",
+						Format:           "p",
+						SchemaOnly:       true,
+						ExcludeSchemas:   excludedSchemas,
+						ExcludeTables:    []string{pglib.QuoteQualifiedIdentifier(excludedSchema, excludedTable)},
+					}, po)
+					return schemaDump, nil
+				case 2:
+					require.Equal(t, pglib.PGDumpOptions{
+						ConnectionString: "source-url",
+						Format:           "p",
+						DataOnly:         true,
+						Tables:           []string{testSequence},
+					}, po)
+					return sequenceDump, nil
+				default:
+					return nil, fmt.Errorf("unexpected call to pgdumpFn: %d", i)
+				}
+			}),
+			pgdumpallFn: newMockPgdumpall(func(_ context.Context, i uint, po pglib.PGDumpAllOptions) ([]byte, error) {
+				switch i {
+				case 1:
+					require.Equal(t, pglib.PGDumpAllOptions{
+						ConnectionString: "source-url",
+						RolesOnly:        true,
+					}, po)
+					return rolesDumpOriginal, nil
+				default:
+					return nil, fmt.Errorf("unexpected call to pgdumpallFn: %d", i)
+				}
+			}),
+			pgrestoreFn: newMockPgrestore(fullDumpRestoreFn),
+
+			generator: &generatormocks.Generator{
+				CreateSnapshotFn: func(ctx context.Context, ss *snapshot.Snapshot) error {
+					// wrapped generator gets captured columns
+					require.Equal(t, &snapshot.Snapshot{
+						TableColumns: testCapturedColumns,
+						SchemaTables: map[string][]string{
+							testSchema: {testTable},
+						},
+						SchemaOnlyTables: map[string][]string{
+							testSchema: {"schema_only_table"},
+						},
+					}, ss)
+					return nil
+				},
+			},
+
+			wantErr: nil,
+		},
+		{
+			name: "ok - only schema-only tables",
+			snapshot: &snapshot.Snapshot{
+				SchemaOnlyTables: map[string][]string{
+					testSchema: {testTable},
+				},
+			},
+			conn: validQuerier(),
+			pgdumpFn: newMockPgdump(func(_ context.Context, i uint, po pglib.PGDumpOptions) ([]byte, error) {
+				switch i {
+				case 1:
+					require.Equal(t, pglib.PGDumpOptions{
+						ConnectionString: "source-url",
+						Format:           "p",
+						SchemaOnly:       true,
+						ExcludeSchemas:   excludedSchemas,
+						ExcludeTables:    []string{pglib.QuoteQualifiedIdentifier(excludedSchema, excludedTable)},
+					}, po)
+					return schemaDump, nil
+				case 2:
+					require.Equal(t, pglib.PGDumpOptions{
+						ConnectionString: "source-url",
+						Format:           "p",
+						DataOnly:         true,
+						Tables:           []string{testSequence},
+					}, po)
+					return sequenceDump, nil
+				default:
+					return nil, fmt.Errorf("unexpected call to pgdumpFn: %d", i)
+				}
+			}),
+			pgdumpallFn: newMockPgdumpall(func(_ context.Context, i uint, po pglib.PGDumpAllOptions) ([]byte, error) {
+				switch i {
+				case 1:
+					require.Equal(t, pglib.PGDumpAllOptions{
+						ConnectionString: "source-url",
+						RolesOnly:        true,
+					}, po)
+					return rolesDumpOriginal, nil
+				default:
+					return nil, fmt.Errorf("unexpected call to pgdumpallFn: %d", i)
+				}
+			}),
+			pgrestoreFn: newMockPgrestore(fullDumpRestoreFn),
+
+			generator: &generatormocks.Generator{
+				CreateSnapshotFn: func(ctx context.Context, ss *snapshot.Snapshot) error {
+					require.Equal(t, &snapshot.Snapshot{
+						SchemaOnlyTables: map[string][]string{
+							testSchema: {testTable},
+						},
+						TableColumns: testCapturedColumns,
+					}, ss)
+					return nil
+				},
+			},
+
+			wantErr: nil,
+		},
+		{
+			name: "error - wildcard schema-only schema with specific table",
+			snapshot: &snapshot.Snapshot{
+				SchemaTables: map[string][]string{
+					testSchema: {testTable},
+				},
+				SchemaOnlyTables: map[string][]string{
+					wildcard: {"table1"},
+				},
+			},
+			conn: validQuerier(),
+
+			wantErr: fmt.Errorf("wildcard schema must be used with wildcard table, got %q", []string{"table1"}),
+		},
+		{
+			name: "ok - wildcard table",
+			snapshot: &snapshot.Snapshot{
+				SchemaTables: map[string][]string{
+					testSchema: {wildcard},
+				},
+			},
+			conn: validQuerier(),
+			pgdumpFn: newMockPgdump(func(_ context.Context, i uint, po pglib.PGDumpOptions) ([]byte, error) {
+				switch i {
+				case 1:
+					require.Equal(t, pglib.PGDumpOptions{
+						ConnectionString: "source-url",
+						Format:           "p",
+						SchemaOnly:       true,
+						ExcludeSchemas:   excludedSchemas,
+					}, po)
+					return schemaDump, nil
+				case 2:
+					require.Equal(t, pglib.PGDumpOptions{
+						ConnectionString: "source-url",
+						Format:           "p",
+						DataOnly:         true,
+						Tables:           []string{testSequence},
+					}, po)
+					return sequenceDump, nil
+				default:
+					return nil, fmt.Errorf("unexpected call to pgdumpFn: %d", i)
+				}
+			}),
+			pgdumpallFn: newMockPgdumpall(func(_ context.Context, i uint, po pglib.PGDumpAllOptions) ([]byte, error) {
+				switch i {
+				case 1:
+					require.Equal(t, pglib.PGDumpAllOptions{
+						ConnectionString: "source-url",
+						RolesOnly:        true,
+					}, po)
+					return rolesDumpOriginal, nil
+				default:
+					return nil, fmt.Errorf("unexpected call to pgdumpallFn: %d", i)
+				}
+			}),
+			pgrestoreFn: newMockPgrestore(fullDumpRestoreFn),
+
+			wantErr: nil,
+		},
+		{
+			name: "ok - wildcard schema",
+			snapshot: &snapshot.Snapshot{
+				SchemaTables: map[string][]string{
+					wildcard: {testTable},
+				},
+				SchemaExcludedTables: map[string][]string{
+					excludedSchema: {excludedTable2},
+				},
+			},
+			conn: validQuerier(),
+			pgdumpFn: newMockPgdump(func(_ context.Context, i uint, po pglib.PGDumpOptions) ([]byte, error) {
+				switch i {
+				case 1:
+					require.Equal(t, pglib.PGDumpOptions{
+						ConnectionString: "source-url",
+						Format:           "p",
+						SchemaOnly:       true,
+						ExcludeSchemas:   pgstreamExcludedSchemas,
+						ExcludeTables:    []string{pglib.QuoteQualifiedIdentifier(excludedSchema, excludedTable), pglib.QuoteQualifiedIdentifier(excludedSchema, excludedTable2)},
+					}, po)
+					return schemaDump, nil
+				case 2:
+					require.Equal(t, pglib.PGDumpOptions{
+						ConnectionString: "source-url",
+						Format:           "p",
+						DataOnly:         true,
+						Tables:           []string{testSequence},
+					}, po)
+					return sequenceDump, nil
+				default:
+					return nil, fmt.Errorf("unexpected call to pgdumpFn: %d", i)
+				}
+			}),
+			pgdumpallFn: newMockPgdumpall(func(_ context.Context, i uint, po pglib.PGDumpAllOptions) ([]byte, error) {
+				switch i {
+				case 1:
+					require.Equal(t, pglib.PGDumpAllOptions{
+						ConnectionString: "source-url",
+						RolesOnly:        true,
+					}, po)
+					return rolesDumpOriginal, nil
+				default:
+					return nil, fmt.Errorf("unexpected call to pgdumpallFn: %d", i)
+				}
+			}),
+			pgrestoreFn: newMockPgrestore(fullDumpNoSchemaCreateRestoreFn),
+
+			wantErr: nil,
+		},
+		{
+			name: "ok - wildcard schema and table",
+			snapshot: &snapshot.Snapshot{
+				SchemaTables: map[string][]string{
+					wildcard: {wildcard},
+				},
+			},
+			conn: validQuerier(),
+			pgdumpFn: newMockPgdump(func(_ context.Context, i uint, po pglib.PGDumpOptions) ([]byte, error) {
+				switch i {
+				case 1:
+					require.Equal(t, pglib.PGDumpOptions{
+						ConnectionString: "source-url",
+						Format:           "p",
+						SchemaOnly:       true,
+						ExcludeSchemas:   pgstreamExcludedSchemas,
+					}, po)
+					return schemaDump, nil
+				case 2:
+					require.Equal(t, pglib.PGDumpOptions{
+						ConnectionString: "source-url",
+						Format:           "p",
+						DataOnly:         true,
+						Tables:           []string{testSequence},
+					}, po)
+					return sequenceDump, nil
+				default:
+					return nil, fmt.Errorf("unexpected call to pgdumpFn: %d", i)
+				}
+			}),
+			pgdumpallFn: newMockPgdumpall(func(_ context.Context, i uint, po pglib.PGDumpAllOptions) ([]byte, error) {
+				switch i {
+				case 1:
+					require.Equal(t, pglib.PGDumpAllOptions{
+						ConnectionString: "source-url",
+						RolesOnly:        true,
+					}, po)
+					return rolesDumpOriginal, nil
+				default:
+					return nil, fmt.Errorf("unexpected call to pgdumpallFn: %d", i)
+				}
+			}),
+			pgrestoreFn: newMockPgrestore(fullDumpNoSchemaCreateRestoreFn),
+
+			wantErr: nil,
+		},
+		{
+			name:              "ok - no roles dump",
+			rolesSnapshotMode: "disabled",
+			snapshot: &snapshot.Snapshot{
+				SchemaTables: map[string][]string{
+					testSchema: {wildcard},
+				},
+			},
+			conn: validQuerier(),
+			pgdumpFn: newMockPgdump(func(_ context.Context, i uint, po pglib.PGDumpOptions) ([]byte, error) {
+				switch i {
+				case 1:
+					require.Equal(t, pglib.PGDumpOptions{
+						ConnectionString: "source-url",
+						Format:           "p",
+						SchemaOnly:       true,
+						ExcludeSchemas:   excludedSchemas,
+					}, po)
+					return schemaDump, nil
+				case 2:
+					require.Equal(t, pglib.PGDumpOptions{
+						ConnectionString: "source-url",
+						Format:           "p",
+						DataOnly:         true,
+						Tables:           []string{testSequence},
+					}, po)
+					return sequenceDump, nil
+				default:
+					return nil, fmt.Errorf("unexpected call to pgdumpFn: %d", i)
+				}
+			}),
+			pgdumpallFn: newMockPgdumpall(func(_ context.Context, i uint, po pglib.PGDumpAllOptions) ([]byte, error) {
+				switch i {
+				case 1:
+					require.Equal(t, pglib.PGDumpAllOptions{
+						ConnectionString: "source-url",
+						RolesOnly:        true,
+						NoPasswords:      false,
+					}, po)
+					return rolesDumpOriginal, nil
+				default:
+					return nil, fmt.Errorf("unexpected call to pgdumpallFn: %d", i)
+				}
+			}),
+			pgrestoreFn: newMockPgrestore(func(_ context.Context, i uint, po pglib.PGRestoreOptions, dump []byte) (string, error) {
+				require.Equal(t, pglib.PGRestoreOptions{
+					ConnectionString: "target-url",
+					Format:           "p",
+				}, po)
+				switch i {
+				case 1:
+					require.Equal(t, string(schemaCreateDump), string(dump))
+				case 2:
+					require.Equal(t, string(filteredDump), string(dump))
+				case 3:
+					require.Equal(t, string(sequenceDump), string(dump))
+				case 4:
+					require.Equal(t, string(indexDump), string(dump))
+				default:
+					return "", fmt.Errorf("unexpected call to pgrestoreFn: %d", i)
+				}
+				return "", nil
+			}),
+
+			wantErr: nil,
+		},
+		{
+			name:              "ok - roles dump with no passwords",
+			rolesSnapshotMode: "no_passwords",
+			snapshot: &snapshot.Snapshot{
+				SchemaTables: map[string][]string{
+					testSchema: {wildcard},
+				},
+			},
+			conn: validQuerier(),
+			pgdumpFn: newMockPgdump(func(_ context.Context, i uint, po pglib.PGDumpOptions) ([]byte, error) {
+				switch i {
+				case 1:
+					require.Equal(t, pglib.PGDumpOptions{
+						ConnectionString: "source-url",
+						Format:           "p",
+						SchemaOnly:       true,
+						ExcludeSchemas:   excludedSchemas,
+					}, po)
+					return schemaDump, nil
+				case 2:
+					require.Equal(t, pglib.PGDumpOptions{
+						ConnectionString: "source-url",
+						Format:           "p",
+						DataOnly:         true,
+						Tables:           []string{testSequence},
+					}, po)
+					return sequenceDump, nil
+				default:
+					return nil, fmt.Errorf("unexpected call to pgdumpFn: %d", i)
+				}
+			}),
+			pgdumpallFn: newMockPgdumpall(func(_ context.Context, i uint, po pglib.PGDumpAllOptions) ([]byte, error) {
+				switch i {
+				case 1:
+					require.Equal(t, pglib.PGDumpAllOptions{
+						ConnectionString: "source-url",
+						RolesOnly:        true,
+						NoPasswords:      true,
+					}, po)
+					return rolesDumpOriginal, nil
+				default:
+					return nil, fmt.Errorf("unexpected call to pgdumpallFn: %d", i)
+				}
+			}),
+			pgrestoreFn: newMockPgrestore(fullDumpRestoreFn),
+
+			wantErr: nil,
+		},
+		{
+			name:          "ok - with clean option",
+			cleanTargetDB: true,
+			snapshot: &snapshot.Snapshot{
+				SchemaTables: map[string][]string{
+					wildcard: {wildcard},
+				},
+			},
+			conn: validQuerier(),
+			pgdumpFn: newMockPgdump(func(_ context.Context, i uint, po pglib.PGDumpOptions) ([]byte, error) {
+				switch i {
+				case 1:
+					require.Equal(t, pglib.PGDumpOptions{
+						ConnectionString: "source-url",
+						Format:           "p",
+						SchemaOnly:       true,
+						Clean:            false,
+						ExcludeSchemas:   pgstreamExcludedSchemas,
+					}, po)
+					return schemaDump, nil
+				case 2:
+					require.Equal(t, pglib.PGDumpOptions{
+						ConnectionString: "source-url",
+						Format:           "p",
+						SchemaOnly:       true,
+						Clean:            true,
+						ExcludeSchemas:   pgstreamExcludedSchemas,
+					}, po)
+					return append(cleanupDump, schemaDump...), nil
+				case 3:
+					require.Equal(t, pglib.PGDumpOptions{
+						ConnectionString: "source-url",
+						Format:           "p",
+						DataOnly:         true,
+						Tables:           []string{testSequence},
+					}, po)
+					return sequenceDump, nil
+				default:
+					return nil, fmt.Errorf("unexpected call to pgdumpFn: %d", i)
+				}
+			}),
+			pgdumpallFn: newMockPgdumpall(func(_ context.Context, i uint, po pglib.PGDumpAllOptions) ([]byte, error) {
+				switch i {
+				case 1:
+					require.Equal(t, pglib.PGDumpAllOptions{
+						ConnectionString: "source-url",
+						RolesOnly:        true,
+						Clean:            true,
+					}, po)
+					return rolesDumpOriginal, nil
+				default:
+					return nil, fmt.Errorf("unexpected call to pgdumpallFn: %d", i)
+				}
+			}),
+			pgrestoreFn: newMockPgrestore(func(_ context.Context, i uint, po pglib.PGRestoreOptions, dump []byte) (string, error) {
+				require.Equal(t, pglib.PGRestoreOptions{
+					ConnectionString: "target-url",
+					Format:           "p",
+					Clean:            true,
+				}, po)
+				switch i {
+				case 1:
+					require.Equal(t, string(cleanupDump), string(dump))
+				case 2:
+					require.Equal(t, string(rolesDumpFiltered), string(dump))
+				case 3:
+					require.Equal(t, string(filteredDump), string(dump))
+				case 4:
+					require.Equal(t, string(sequenceDump), string(dump))
+				case 5:
+					require.Equal(t, string(indexDump), string(dump))
+				default:
+					return "", fmt.Errorf("unexpected call to pgrestoreFn: %d", i)
+				}
+				return "", nil
+			}),
+
+			wantErr: nil,
+		},
+		{
+			name: "ok - no tables in public schema",
+			snapshot: &snapshot.Snapshot{
+				SchemaTables: map[string][]string{
+					publicSchema: {},
+				},
+			},
+			conn: &mocks.Querier{
+				QueryFn: func(ctx context.Context, _ uint, query string, args ...any) (pglib.Rows, error) {
+					return nil, fmt.Errorf("unexpected query: %s", query)
+				},
+				ExecFn: func(ctx context.Context, i uint, query string, args ...any) (pglib.CommandTag, error) {
+					return pglib.CommandTag{}, errors.New("ExecFn: should not be called")
+				},
+			},
+			pgdumpFn: func(_ context.Context, po pglib.PGDumpOptions) ([]byte, error) {
+				return nil, errors.New("pgdumpFn: should not be called")
+			},
+			pgdumpallFn: func(_ context.Context, po pglib.PGDumpAllOptions) ([]byte, error) {
+				return nil, errors.New("pgdumpallFn: should not be called")
+			},
+			pgrestoreFn: func(_ context.Context, po pglib.PGRestoreOptions, dump []byte) (string, error) {
+				return "", errors.New("pgrestoreFn: should not be called")
+			},
+
+			wantErr: nil,
+		},
+		{
+			name: "error - querying excluded schemas",
+			snapshot: &snapshot.Snapshot{
+				SchemaTables: map[string][]string{
+					testSchema: {testTable},
+				},
+			},
+			conn: &mocks.Querier{
+				QueryFn: func(ctx context.Context, _ uint, query string, args ...any) (pglib.Rows, error) {
+					return nil, errTest
+				},
+			},
+			pgdumpFn: func(_ context.Context, po pglib.PGDumpOptions) ([]byte, error) {
+				return nil, errors.New("pgdumpFn: should not be called")
+			},
+			pgdumpallFn: func(_ context.Context, po pglib.PGDumpAllOptions) ([]byte, error) {
+				return nil, errors.New("pgdumpallFn: should not be called")
+			},
+			pgrestoreFn: func(_ context.Context, po pglib.PGRestoreOptions, dump []byte) (string, error) {
+				return "", errors.New("pgrestoreFn: should not be called")
+			},
+
+			wantErr: errTest,
+		},
+		{
+			name: "error - scanning excluded tables",
+			snapshot: &snapshot.Snapshot{
+				SchemaTables: map[string][]string{
+					testSchema: {testTable},
+				},
+			},
+			conn: &mocks.Querier{
+				QueryFn: func(ctx context.Context, _ uint, query string, args ...any) (pglib.Rows, error) {
+					switch query {
+					case selectSchemasQuery:
+						require.Equal(t, []any{[]string{testSchema}}, args)
+						return &mocks.Rows{
+							CloseFn: func() {},
+							NextFn:  func(i uint) bool { return i == 1 },
+							ScanFn: func(i uint, dest ...any) error {
+								require.Len(t, dest, 1)
+								schemaName, ok := dest[0].(*string)
+								require.True(t, ok)
+								*schemaName = excludedSchema
+								return nil
+							},
+							ErrFn: func() error { return nil },
+						}, nil
+					case selectSchemaTablesQuery:
+						require.Equal(t, []any{"test_schema", []string{testTable}}, args)
+						return &mocks.Rows{
+							CloseFn: func() {},
+							NextFn:  func(i uint) bool { return i == 1 },
+							ScanFn: func(i uint, dest ...any) error {
+								return errTest
+							},
+							ErrFn: func() error { return nil },
+						}, nil
+					default:
+						return nil, fmt.Errorf("unexpected query: %s", query)
+					}
+				},
+			},
+			pgdumpFn: func(_ context.Context, po pglib.PGDumpOptions) ([]byte, error) {
+				return nil, errors.New("pgdumpFn: should not be called")
+			},
+			pgdumpallFn: func(_ context.Context, po pglib.PGDumpAllOptions) ([]byte, error) {
+				return nil, errors.New("pgdumpallFn: should not be called")
+			},
+			pgrestoreFn: func(_ context.Context, po pglib.PGRestoreOptions, dump []byte) (string, error) {
+				return "", errors.New("pgrestoreFn: should not be called")
+			},
+
+			wantErr: errTest,
+		},
+		{
+			name: "error - excluded tables rows",
+			snapshot: &snapshot.Snapshot{
+				SchemaTables: map[string][]string{
+					testSchema: {testTable},
+				},
+			},
+			conn: &mocks.Querier{
+				ExecFn: func(ctx context.Context, i uint, query string, args ...any) (pglib.CommandTag, error) {
+					require.Equal(t, "CREATE SCHEMA IF NOT EXISTS "+quotedTestSchema, query)
+					return pglib.CommandTag{}, nil
+				},
+				QueryFn: func(ctx context.Context, _ uint, query string, args ...any) (pglib.Rows, error) {
+					switch query {
+					case selectSchemasQuery:
+						require.Equal(t, []any{[]string{testSchema}}, args)
+						return &mocks.Rows{
+							CloseFn: func() {},
+							NextFn:  func(i uint) bool { return i == 1 },
+							ScanFn: func(i uint, dest ...any) error {
+								require.Len(t, dest, 1)
+								schemaName, ok := dest[0].(*string)
+								require.True(t, ok)
+								*schemaName = excludedSchema
+								return nil
+							},
+							ErrFn: func() error { return nil },
+						}, nil
+					case selectSchemaTablesQuery:
+						require.Equal(t, []any{"test_schema", []string{testTable}}, args)
+						return &mocks.Rows{
+							CloseFn: func() {},
+							NextFn:  func(i uint) bool { return i == 1 },
+							ScanFn: func(i uint, dest ...any) error {
+								require.Len(t, dest, 2)
+								schemaName, ok := dest[0].(*string)
+								require.True(t, ok)
+								*schemaName = excludedSchema
+								tableName, ok := dest[1].(*string)
+								require.True(t, ok)
+								*tableName = excludedTable
+								return nil
+							},
+							ErrFn: func() error { return errTest },
+						}, nil
+					default:
+						return nil, fmt.Errorf("unexpected query: %s", query)
+					}
+				},
+			},
+			pgdumpFn: func(_ context.Context, po pglib.PGDumpOptions) ([]byte, error) {
+				return nil, errors.New("pgdumpFn: should not be called")
+			},
+			pgdumpallFn: func(_ context.Context, po pglib.PGDumpAllOptions) ([]byte, error) {
+				return nil, errors.New("pgdumpallFn: should not be called")
+			},
+			pgrestoreFn: func(_ context.Context, po pglib.PGRestoreOptions, dump []byte) (string, error) {
+				return "", errors.New("pgrestoreFn: should not be called")
+			},
+
+			wantErr: errTest,
+		},
+		{
+			name: "error - dumping schema",
+			snapshot: &snapshot.Snapshot{
+				SchemaTables: map[string][]string{
+					testSchema: {testTable},
+				},
+			},
+			conn: validQuerier(),
+			pgdumpFn: newMockPgdump(func(_ context.Context, i uint, po pglib.PGDumpOptions) ([]byte, error) {
+				switch i {
+				case 1:
+					return nil, errTest
+				default:
+					return nil, fmt.Errorf("unexpected call to pgdumpFn: %d", i)
+				}
+			}),
+			pgdumpallFn: func(_ context.Context, po pglib.PGDumpAllOptions) ([]byte, error) {
+				return nil, errors.New("pgdumpallFn: should not be called")
+			},
+			pgrestoreFn: func(_ context.Context, po pglib.PGRestoreOptions, dump []byte) (string, error) {
+				return "", errors.New("pgrestoreFn: should not be called")
+			},
+
+			wantErr: errTest,
+		},
+		{
+			name: "error - dumping sequence values",
+			snapshot: &snapshot.Snapshot{
+				SchemaTables: map[string][]string{
+					testSchema: {testTable},
+				},
+			},
+			conn: validQuerier(),
+			pgdumpFn: newMockPgdump(func(_ context.Context, i uint, po pglib.PGDumpOptions) ([]byte, error) {
+				switch i {
+				case 1:
+					return schemaDump, nil
+				case 2:
+					return nil, errTest
+				default:
+					return nil, fmt.Errorf("unexpected call to pgdumpFn: %d", i)
+				}
+			}),
+			pgdumpallFn: func(_ context.Context, po pglib.PGDumpAllOptions) ([]byte, error) {
+				return nil, errors.New("pgdumpallFn: should not be called")
+			},
+			pgrestoreFn: func(_ context.Context, po pglib.PGRestoreOptions, dump []byte) (string, error) {
+				return "", errors.New("pgrestoreFn: should not be called")
+			},
+
+			wantErr: errTest,
+		},
+		{
+			name: "error - dumping roles",
+			snapshot: &snapshot.Snapshot{
+				SchemaTables: map[string][]string{
+					testSchema: {testTable},
+				},
+			},
+			conn: validQuerier(),
+			pgdumpFn: func(_ context.Context, po pglib.PGDumpOptions) ([]byte, error) {
+				return schemaDump, nil
+			},
+			pgdumpallFn: func(_ context.Context, po pglib.PGDumpAllOptions) ([]byte, error) {
+				return nil, errTest
+			},
+			pgrestoreFn: func(_ context.Context, po pglib.PGRestoreOptions, dump []byte) (string, error) {
+				return "", errors.New("pgrestoreFn: should not be called")
+			},
+
+			wantErr: errTest,
+		},
+		{
+			name: "error - restoring schema dump",
+			snapshot: &snapshot.Snapshot{
+				SchemaTables: map[string][]string{
+					testSchema: {testTable},
+				},
+			},
+			conn: validQuerier(),
+			pgdumpFn: func(_ context.Context, po pglib.PGDumpOptions) ([]byte, error) {
+				return schemaDump, nil
+			},
+			pgdumpallFn: func(_ context.Context, po pglib.PGDumpAllOptions) ([]byte, error) {
+				return rolesDumpOriginal, nil
+			},
+			pgrestoreFn: func(_ context.Context, po pglib.PGRestoreOptions, dump []byte) (string, error) {
+				return "", errTest
+			},
+
+			wantErr: errTest,
+		},
+		{
+			name: "error - restoring filtered dump",
+			snapshot: &snapshot.Snapshot{
+				SchemaTables: map[string][]string{
+					testSchema: {testTable},
+				},
+			},
+			conn: validQuerier(),
+			pgdumpFn: newMockPgdump(func(_ context.Context, i uint, po pglib.PGDumpOptions) ([]byte, error) {
+				switch i {
+				case 1:
+					require.Equal(t, pglib.PGDumpOptions{
+						ConnectionString: "source-url",
+						Format:           "p",
+						SchemaOnly:       true,
+						ExcludeSchemas:   excludedSchemas,
+						ExcludeTables:    []string{pglib.QuoteQualifiedIdentifier(excludedSchema, excludedTable)},
+					}, po)
+					return schemaDump, nil
+				case 2:
+					require.Equal(t, pglib.PGDumpOptions{
+						ConnectionString: "source-url",
+						Format:           "p",
+						DataOnly:         true,
+						Tables:           []string{testSequence},
+					}, po)
+					return sequenceDump, nil
+				default:
+					return nil, fmt.Errorf("unexpected call to pgdumpFn: %d", i)
+				}
+			}),
+			pgdumpallFn: newMockPgdumpall(func(_ context.Context, i uint, po pglib.PGDumpAllOptions) ([]byte, error) {
+				switch i {
+				case 1:
+					require.Equal(t, pglib.PGDumpAllOptions{
+						ConnectionString: "source-url",
+						RolesOnly:        true,
+					}, po)
+					return rolesDumpOriginal, nil
+				default:
+					return nil, fmt.Errorf("unexpected call to pgdumpallFn: %d", i)
+				}
+			}),
+			pgrestoreFn: newMockPgrestore(func(_ context.Context, i uint, po pglib.PGRestoreOptions, dump []byte) (string, error) {
+				require.Equal(t, pglib.PGRestoreOptions{
+					ConnectionString: "target-url",
+					Format:           "p",
+				}, po)
+				switch i {
+				case 1:
+					return "", errTest
+				default:
+					return "", fmt.Errorf("unexpected call to pgrestoreFn: %d", i)
+				}
+			}),
+			generator: &generatormocks.Generator{
+				CreateSnapshotFn: func(ctx context.Context, ss *snapshot.Snapshot) error {
+					require.Equal(t, &snapshot.Snapshot{
+						SchemaTables: map[string][]string{
+							testSchema: {testTable},
+						},
+					}, ss)
+					return errors.New("CreateSnapshotFn: should not be called")
+				},
+			},
+
+			wantErr: errTest,
+		},
+		{
+			name: "error - calling internal generator CreateSnapshot",
+			snapshot: &snapshot.Snapshot{
+				SchemaTables: map[string][]string{
+					testSchema: {testTable},
+				},
+			},
+			conn: validQuerier(),
+			pgdumpFn: newMockPgdump(func(_ context.Context, i uint, po pglib.PGDumpOptions) ([]byte, error) {
+				switch i {
+				case 1:
+					require.Equal(t, pglib.PGDumpOptions{
+						ConnectionString: "source-url",
+						Format:           "p",
+						SchemaOnly:       true,
+						ExcludeSchemas:   excludedSchemas,
+						ExcludeTables:    []string{pglib.QuoteQualifiedIdentifier(excludedSchema, excludedTable)},
+					}, po)
+					return schemaDump, nil
+				case 2:
+					require.Equal(t, pglib.PGDumpOptions{
+						ConnectionString: "source-url",
+						Format:           "p",
+						DataOnly:         true,
+						Tables:           []string{testSequence},
+					}, po)
+					return sequenceDump, nil
+				default:
+					return nil, fmt.Errorf("unexpected call to pgdumpFn: %d", i)
+				}
+			}),
+			pgdumpallFn: newMockPgdumpall(func(_ context.Context, i uint, po pglib.PGDumpAllOptions) ([]byte, error) {
+				switch i {
+				case 1:
+					require.Equal(t, pglib.PGDumpAllOptions{
+						ConnectionString: "source-url",
+						RolesOnly:        true,
+					}, po)
+					return rolesDumpOriginal, nil
+				default:
+					return nil, fmt.Errorf("unexpected call to pgdumpallFn: %d", i)
+				}
+			}),
+			pgrestoreFn: newMockPgrestore(func(_ context.Context, i uint, po pglib.PGRestoreOptions, dump []byte) (string, error) {
+				require.Equal(t, pglib.PGRestoreOptions{
+					ConnectionString: "target-url",
+					Format:           "p",
+				}, po)
+				switch i {
+				case 1, 2, 3:
+					return "", nil
+				default:
+					return "", fmt.Errorf("unexpected call to pgrestoreFn: %d", i)
+				}
+			}),
+			generator: &generatormocks.Generator{
+				CreateSnapshotFn: func(ctx context.Context, ss *snapshot.Snapshot) error {
+					return errTest
+				},
+			},
+
+			wantErr: errTest,
+		},
+		{
+			name: "error - performing pgrestore output critical error",
+			snapshot: &snapshot.Snapshot{
+				SchemaTables: map[string][]string{
+					testSchema: {testTable},
+				},
+			},
+			conn: validQuerier(),
+			pgdumpFn: func(_ context.Context, po pglib.PGDumpOptions) ([]byte, error) {
+				return schemaDump, nil
+			},
+			pgdumpallFn: func(_ context.Context, po pglib.PGDumpAllOptions) ([]byte, error) {
+				return rolesDumpOriginal, nil
+			},
+			pgrestoreFn: func(_ context.Context, po pglib.PGRestoreOptions, dump []byte) (string, error) {
+				return "", pglib.NewPGRestoreErrors(errTest)
+			},
+
+			wantErr: pglib.NewPGRestoreErrors(errTest),
+		},
+		{
+			name: "error - performing pgrestore output ignored errors",
+			snapshot: &snapshot.Snapshot{
+				SchemaTables: map[string][]string{
+					testSchema: {testTable},
+				},
+			},
+			conn: validQuerier(),
+			pgdumpFn: func(_ context.Context, po pglib.PGDumpOptions) ([]byte, error) {
+				return schemaDump, nil
+			},
+			pgdumpallFn: func(_ context.Context, po pglib.PGDumpAllOptions) ([]byte, error) {
+				return rolesDumpOriginal, nil
+			},
+			pgrestoreFn: func(_ context.Context, po pglib.PGRestoreOptions, dump []byte) (string, error) {
+				return "", pglib.NewPGRestoreErrors(&pglib.ErrRelationAlreadyExists{})
+			},
+
+			wantErr: nil,
+		},
+		{
+			name: "error - creating schema",
+			snapshot: &snapshot.Snapshot{
+				SchemaTables: map[string][]string{
+					testSchema: {testTable},
+				},
+			},
+			conn: validQuerier(),
+			pgdumpFn: func(_ context.Context, po pglib.PGDumpOptions) ([]byte, error) {
+				return schemaDump, nil
+			},
+			pgdumpallFn: func(_ context.Context, po pglib.PGDumpAllOptions) ([]byte, error) {
+				return rolesDumpOriginal, nil
+			},
+			pgrestoreFn: func(_ context.Context, po pglib.PGRestoreOptions, dump []byte) (string, error) {
+				require.Equal(t, string(schemaCreateDump), string(dump))
+				return "", errTest
+			},
+
+			wantErr: errTest,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			sg := SnapshotGenerator{
+				sourceURL:     "source-url",
+				targetURL:     "target-url",
+				sourceQuerier: tc.conn,
+				pgDumpFn:      tc.pgdumpFn,
+				pgDumpAllFn:   tc.pgdumpallFn,
+				pgRestoreFn:   tc.pgrestoreFn,
+				logger:        log.NewNoopLogger(),
+				generator:     tc.generator,
+				roleSQLParser: &roleSQLParser{},
+				optionGenerator: &optionGenerator{
+					sourceURL:              "source-url",
+					targetURL:              "target-url",
+					includeGlobalDBObjects: true,
+					role:                   tc.role,
+					noOwner:                tc.noOwner,
+					noPrivileges:           tc.noPrivileges,
+					rolesSnapshotMode:      tc.rolesSnapshotMode,
+					cleanTargetDB:          tc.cleanTargetDB,
+					querier:                tc.conn,
+				},
+			}
+
+			if tc.snapshotTracker != nil {
+				sg.snapshotTracker = tc.snapshotTracker
+			}
+
+			err := sg.CreateSnapshot(context.Background(), tc.snapshot)
+			if !errors.Is(err, tc.wantErr) {
+				require.Equal(t, tc.wantErr, err)
+			}
+			sg.Close()
+		})
+	}
+}
+
+func TestSnapshotGenerator_RestoresConstraintsBeforeDataWhenConfigured(t *testing.T) {
+	t.Parallel()
+
+	schemaDump := []byte(`CREATE TABLE public.test_table (
+    id integer NOT NULL,
+    parent_id integer,
+    value text NOT NULL
+);
+
+ALTER TABLE ONLY public.test_table
+    ADD CONSTRAINT test_table_pkey PRIMARY KEY (id);
+
+ALTER TABLE ONLY public.test_table
+    ADD CONSTRAINT test_table_value_key UNIQUE (value);
+
+ALTER TABLE ONLY public.test_table
+    ADD CONSTRAINT "test_table UNIQUE named foreign key" FOREIGN KEY (parent_id) REFERENCES public.test_table(id);
+
+CREATE INDEX test_table_value_idx ON public.test_table USING btree (value);
+`)
+	filteredDump := []byte(`CREATE TABLE public.test_table (
+    id integer NOT NULL,
+    parent_id integer,
+    value text NOT NULL
+);
+
+`)
+	conflictTargetDump := []byte(`ALTER TABLE ONLY public.test_table
+    ADD CONSTRAINT test_table_pkey PRIMARY KEY (id);
+
+ALTER TABLE ONLY public.test_table
+    ADD CONSTRAINT test_table_value_key UNIQUE (value);
+
+`)
+	remainingConstraintsDump := []byte(`ALTER TABLE ONLY public.test_table
+    ADD CONSTRAINT "test_table UNIQUE named foreign key" FOREIGN KEY (parent_id) REFERENCES public.test_table(id);
+
+CREATE INDEX test_table_value_idx ON public.test_table USING btree (value);
+
+`)
+
+	calls := []string{}
+	conn := &mocks.Querier{
+		ExecFn: func(ctx context.Context, i uint, query string, args ...any) (pglib.CommandTag, error) {
+			return pglib.CommandTag{}, nil
+		},
+		QueryFn: func(ctx context.Context, i uint, query string, args ...any) (pglib.Rows, error) {
+			return &mocks.Rows{
+				CloseFn: func() {},
+				NextFn:  func(i uint) bool { return false },
+				ErrFn:   func() error { return nil },
+			}, nil
+		},
+	}
+
+	sg := SnapshotGenerator{
+		sourceURL:     "source-url",
+		targetURL:     "target-url",
+		sourceQuerier: conn,
+		pgDumpFn: newMockPgdump(func(_ context.Context, i uint, po pglib.PGDumpOptions) ([]byte, error) {
+			require.Equal(t, uint(1), i)
+			return schemaDump, nil
+		}),
+		pgRestoreFn: newMockPgrestore(func(_ context.Context, i uint, po pglib.PGRestoreOptions, dump []byte) (string, error) {
+			switch strings.TrimSpace(string(dump)) {
+			case strings.TrimSpace(string(filteredDump)):
+				calls = append(calls, "schema")
+			case strings.TrimSpace(string(conflictTargetDump)):
+				calls = append(calls, "conflict targets")
+			case strings.TrimSpace(string(remainingConstraintsDump)):
+				calls = append(calls, "remaining constraints")
+			default:
+				require.Failf(t, "unexpected dump", "%q", string(dump))
+			}
+			return "", nil
+		}),
+		logger: log.NewNoopLogger(),
+		generator: &generatormocks.Generator{
+			CreateSnapshotFn: func(ctx context.Context, snapshot *snapshot.Snapshot) error {
+				calls = append(calls, "data")
+				return nil
+			},
+		},
+		roleSQLParser: &roleSQLParser{},
+		optionGenerator: &optionGenerator{
+			sourceURL:         "source-url",
+			targetURL:         "target-url",
+			noOwner:           true,
+			rolesSnapshotMode: roleSnapshotDisabled,
+			querier:           conn,
+		},
+		restoreConflictTargetsBeforeData: true,
+	}
+
+	err := sg.CreateSnapshot(context.Background(), &snapshot.Snapshot{
+		SchemaTables: map[string][]string{
+			publicSchema: {"test_table"},
+		},
+	})
+	require.NoError(t, err)
+	require.Equal(t, []string{"schema", "conflict targets", "data", "remaining constraints"}, calls)
+}
+
+func TestSnapshotGenerator_restoreIndicesAndConstraintsSessionSettings(t *testing.T) {
+	t.Parallel()
+
+	settings := []string{"maintenance_work_mem=4GB", "max_parallel_maintenance_workers=4"}
+	indexDump := []byte("\\connect test\n\nCREATE INDEX test_idx ON test_table (id);\n")
+	tests := []struct {
+		name         string
+		settings     []string
+		restoreToWAL bool
+		wantSettings []string
+	}{
+		{
+			name:         "postgres restore",
+			settings:     settings,
+			wantSettings: settings,
+		},
+		{
+			name: "postgres restore with empty settings",
+		},
+		{
+			name:         "WAL restore",
+			settings:     settings,
+			restoreToWAL: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			var restoredDump []byte
+			var restoredOptions pglib.PGRestoreOptions
+			sg := &SnapshotGenerator{
+				indexConstraintSessionSettings: tt.settings,
+				logger:                         log.NewNoopLogger(),
+				optionGenerator: &optionGenerator{
+					targetURL: "target-url",
+				},
+			}
+			if tt.restoreToWAL {
+				WithRestoreToWAL(nil)(sg)
+			}
+			sg.pgRestoreFn = func(_ context.Context, opts pglib.PGRestoreOptions, dump []byte) (string, error) {
+				restoredOptions = opts
+				restoredDump = dump
+				return "", nil
+			}
+
+			err := sg.restoreIndicesAndConstraints(context.Background(), indexDump, &snapshot.Snapshot{})
+
+			require.NoError(t, err)
+			require.Equal(t, indexDump, restoredDump)
+			require.Equal(t, tt.wantSettings, restoredOptions.SessionSettings)
+		})
+	}
+}
+
+func TestValidateSessionSettings(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		settings []string
+		wantErr  error
+	}{
+		{
+			name:     "nil settings",
+			settings: nil,
+			wantErr:  nil,
+		},
+		{
+			name:     "valid settings",
+			settings: []string{"maintenance_work_mem=4GB", "max_parallel_maintenance_workers=4", "synchronous_commit=off"},
+			wantErr:  nil,
+		},
+		{
+			name:     "valid setting with dotted name",
+			settings: []string{"pg_stat_statements.max=1000"},
+			wantErr:  nil,
+		},
+		{
+			name:     "missing value",
+			settings: []string{"maintenance_work_mem="},
+			wantErr:  errInvalidSessionSetting,
+		},
+		{
+			name:     "missing equals",
+			settings: []string{"maintenance_work_mem"},
+			wantErr:  errInvalidSessionSetting,
+		},
+		{
+			// whitespace would let a single setting expand into multiple
+			// PGOPTIONS backend options once libpq splits on whitespace
+			name:     "whitespace injects extra options",
+			settings: []string{"maintenance_work_mem=4GB -c session_preload_libraries=/tmp/evil.so"},
+			wantErr:  errInvalidSessionSetting,
+		},
+		{
+			name:     "leading dash in name",
+			settings: []string{"-c foo=bar"},
+			wantErr:  errInvalidSessionSetting,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			err := validateSessionSettings(tt.settings)
+			require.ErrorIs(t, err, tt.wantErr)
+		})
+	}
+}
+
+func TestSnapshotGenerator_parseDump(t *testing.T) {
+	t.Parallel()
+
+	// Read the file as []byte
+	dumpBytes, err := os.ReadFile("test/test_dump.sql")
+	require.NoError(t, err)
+
+	wantFilteredDumpBytes, err := os.ReadFile("test/test_dump_filtered.sql")
+	require.NoError(t, err)
+
+	wantConstraintsBytes, err := os.ReadFile("test/test_dump_constraints.sql")
+	require.NoError(t, err)
+
+	wantEventTriggersBytes, err := os.ReadFile("test/test_dump_event_triggers.sql")
+	require.NoError(t, err)
+
+	wantViewsBytes, err := os.ReadFile("test/test_dump_views.sql")
+	require.NoError(t, err)
+
+	sg := &SnapshotGenerator{
+		excludedSecurityLabels: []string{"anon"},
+	}
+	dump := sg.parseDump(dumpBytes)
+
+	filteredStr := strings.Trim(string(dump.filtered), "\n")
+	wantFilteredStr := strings.Trim(string(wantFilteredDumpBytes), "\n")
+	constraintsStr := strings.Trim(string(dump.indicesAndConstraints), "\n")
+	wantConstraintsStr := strings.Trim(string(wantConstraintsBytes), "\n")
+	eventTriggersStr := strings.Trim(string(dump.eventTriggers), "\n")
+	wantEventTriggersStr := strings.Trim(string(wantEventTriggersBytes), "\n")
+	viewsStr := strings.Trim(string(dump.views), "\n")
+	wantViewsStr := strings.Trim(string(wantViewsBytes), "\n")
+	wantSequences := []string{`"musicbrainz"."alternative_medium_id_seq"`, `"musicbrainz"."Alternative_medium_id_seq"`}
+
+	require.Equal(t, wantFilteredStr, filteredStr)
+	require.Equal(t, wantConstraintsStr, constraintsStr)
+	require.Equal(t, wantSequences, dump.sequences)
+	require.Equal(t, wantEventTriggersStr, eventTriggersStr)
+	require.Equal(t, wantViewsStr, viewsStr)
+}
+
+func TestSnapshotGenerator_parseDumpMovesClusterOnToConstraints(t *testing.T) {
+	t.Parallel()
+
+	dumpBytes := []byte(`CREATE TABLE public.example_table (
+    id bigint NOT NULL,
+    created_at timestamp without time zone
+);
+
+CREATE INDEX example_table_created_at_idx ON public.example_table USING btree (created_at);
+
+ALTER TABLE public.example_table CLUSTER ON example_table_created_at_idx;
+`)
+
+	dump := (&SnapshotGenerator{}).parseDump(dumpBytes)
+
+	require.Contains(t, string(dump.filtered), "CREATE TABLE public.example_table")
+	require.NotContains(t, string(dump.filtered), "CLUSTER ON example_table_created_at_idx")
+	require.Contains(t, string(dump.indicesAndConstraints), "CREATE INDEX example_table_created_at_idx")
+	require.Contains(t, string(dump.indicesAndConstraints), "ALTER TABLE public.example_table CLUSTER ON example_table_created_at_idx;")
+	require.Less(t,
+		strings.Index(string(dump.indicesAndConstraints), "CREATE INDEX example_table_created_at_idx"),
+		strings.Index(string(dump.indicesAndConstraints), "CLUSTER ON example_table_created_at_idx"))
+}
+
+func TestSnapshotGenerator_parseDumpMovesAttachPartitionToConstraints(t *testing.T) {
+	t.Parallel()
+
+	dumpBytes := []byte(`CREATE TABLE public.events (
+    event_id bigint NOT NULL,
+    partition_id integer NOT NULL
+)
+PARTITION BY LIST (partition_id);
+
+CREATE TABLE public.events_0 (
+    event_id bigint NOT NULL,
+    partition_id integer NOT NULL
+);
+
+ALTER TABLE ONLY public.events ATTACH PARTITION public.events_0 FOR VALUES IN (0);
+
+CREATE INDEX events_partition_id_idx ON ONLY public.events USING btree (partition_id);
+
+CREATE INDEX events_0_partition_id_idx ON public.events_0 USING btree (partition_id);
+
+ALTER INDEX public.events_partition_id_idx ATTACH PARTITION public.events_0_partition_id_idx;
+`)
+
+	dump := (&SnapshotGenerator{}).parseDump(dumpBytes)
+
+	// the table attachment stays with the tables, the index attachment does not
+	require.Contains(t, string(dump.filtered), "ALTER TABLE ONLY public.events ATTACH PARTITION public.events_0")
+	require.NotContains(t, string(dump.filtered), "ALTER INDEX public.events_partition_id_idx ATTACH PARTITION")
+
+	require.Contains(t, string(dump.indicesAndConstraints), "ALTER INDEX public.events_partition_id_idx ATTACH PARTITION public.events_0_partition_id_idx;")
+
+	// and it has to land after the parent index it references, or it fails the
+	// same way it did when it was restored in place
+	require.Less(t,
+		strings.Index(string(dump.indicesAndConstraints), "CREATE INDEX events_partition_id_idx"),
+		strings.Index(string(dump.indicesAndConstraints), "ALTER INDEX public.events_partition_id_idx ATTACH PARTITION"))
+}
+
+func TestSnapshotGenerator_parseDumpMovesMaterializedViewIndexesToViews(t *testing.T) {
+	t.Parallel()
+
+	dumpBytes := []byte(`CREATE MATERIALIZED VIEW public.example_mv AS
+ SELECT 1 AS id
+WITH NO DATA;
+
+CREATE UNIQUE INDEX example_mv_id_idx ON public.example_mv USING btree (id);
+
+CREATE INDEX example_table_id_idx ON public.example_table USING btree (id);
+`)
+
+	dump := (&SnapshotGenerator{}).parseDump(dumpBytes)
+
+	require.Contains(t, string(dump.views), "CREATE MATERIALIZED VIEW public.example_mv")
+	require.Contains(t, string(dump.views), "CREATE UNIQUE INDEX example_mv_id_idx ON public.example_mv")
+	require.NotContains(t, string(dump.indicesAndConstraints), "example_mv_id_idx")
+	require.Contains(t, string(dump.indicesAndConstraints), "CREATE INDEX example_table_id_idx ON public.example_table")
+	require.Contains(t, string(dump.materializedViewRefreshes), "REFRESH MATERIALIZED VIEW public.example_mv WITH DATA;")
+}
+
+func TestSnapshotGenerator_parseDumpSkipsLegacyPublicPLPGSQLHandlers(t *testing.T) {
+	t.Parallel()
+
+	dumpBytes := []byte(`CREATE FUNCTION public.plpgsql_call_handler() RETURNS language_handler
+    LANGUAGE c
+    AS '$libdir/plpgsql', 'plpgsql_call_handler';
+
+CREATE FUNCTION public.plpgsql_validator(oid) RETURNS void
+    LANGUAGE c
+    AS '$libdir/plpgsql', 'plpgsql_validator';
+
+CREATE FUNCTION public.keep_me() RETURNS integer
+    LANGUAGE sql
+    AS $$ SELECT 1 $$;
+`)
+
+	dump := (&SnapshotGenerator{}).parseDump(dumpBytes)
+
+	require.NotContains(t, string(dump.filtered), "CREATE FUNCTION public.plpgsql_call_handler()")
+	require.NotContains(t, string(dump.filtered), "CREATE FUNCTION public.plpgsql_validator(oid)")
+	require.Contains(t, string(dump.filtered), "CREATE FUNCTION public.keep_me() RETURNS integer")
+}
+
+func TestSnapshotGenerator_parseDumpDefersSQLStandardFunctionBodies(t *testing.T) {
+	t.Parallel()
+
+	dumpBytes := []byte(`CREATE FUNCTION public.atomic_fn() RETURNS TABLE(id integer, name text)
+    LANGUAGE sql
+    BEGIN ATOMIC
+ SELECT c.id,
+     c.name
+    FROM public.customers c
+   GROUP BY c.id;
+END;
+
+CREATE FUNCTION public.return_fn() RETURNS bigint
+    LANGUAGE sql
+    RETURN (SELECT count(*) AS count FROM public.customers);
+
+CREATE FUNCTION public.classic_fn(integer[]) RETURNS integer
+    LANGUAGE sql IMMUTABLE
+    AS $_$
+  SELECT val
+  FROM unnest($1) val
+  -- END; and RETURN inside a dollar quoted body must not confuse the parser
+  LIMIT 1;
+$_$;
+
+CREATE FUNCTION public.trigger_fn() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+    RETURN NULL;
+END;
+$$;
+
+CREATE TABLE public.customers (
+    id integer NOT NULL
+);
+`)
+
+	dump := (&SnapshotGenerator{}).parseDump(dumpBytes)
+
+	filtered := string(dump.filtered)
+	views := string(dump.views)
+
+	// SQL-standard bodies are validated at creation time and can depend on
+	// constraints, so they are deferred along with the views
+	require.Contains(t, views, "CREATE FUNCTION public.atomic_fn()")
+	require.Contains(t, views, "CREATE FUNCTION public.return_fn()")
+	require.NotContains(t, filtered, "atomic_fn")
+	require.NotContains(t, filtered, "return_fn")
+
+	// classic quoted bodies stay in the main schema dump
+	require.Contains(t, filtered, "CREATE FUNCTION public.classic_fn(integer[])")
+	require.Contains(t, filtered, "CREATE FUNCTION public.trigger_fn()")
+	require.Contains(t, filtered, "CREATE TABLE public.customers")
+	require.NotContains(t, views, "classic_fn")
+	require.NotContains(t, views, "trigger_fn")
+}
+
+func TestSnapshotGenerator_parseDumpCircularDependencyViews(t *testing.T) {
+	t.Parallel()
+
+	// pg_dump breaks circular view dependencies by emitting a dummy view
+	// upfront and the real definition (CREATE OR REPLACE VIEW, or CREATE RULE
+	// "_RETURN" in older versions) at the end of the dump
+	dumpBytes := []byte(`CREATE VIEW public.circ_view AS
+SELECT
+    NULL::integer AS id,
+    NULL::text AS name;
+
+CREATE FUNCTION public.circ_fn() RETURNS SETOF public.circ_view
+    LANGUAGE sql STABLE
+    AS $$ SELECT id, name FROM circ_view $$;
+
+CREATE TABLE public.circ_base (
+    id integer NOT NULL,
+    name text NOT NULL
+);
+
+CREATE VIEW public.regular_view AS
+ SELECT c.id,
+    c.name
+   FROM public.circ_base c
+  GROUP BY c.id;
+
+CREATE OR REPLACE VIEW public.circ_view AS
+ SELECT c.id,
+    c.name
+   FROM public.circ_base c
+  WHERE (c.id IN ( SELECT circ_fn.id
+           FROM public.circ_fn() circ_fn(id, name)))
+  GROUP BY c.id;
+
+CREATE RULE "_RETURN" AS
+    ON SELECT TO public.legacy_view DO INSTEAD
+ SELECT c.id,
+    c.name
+   FROM public.circ_base c
+  GROUP BY c.id;
+`)
+
+	dump := (&SnapshotGenerator{}).parseDump(dumpBytes)
+
+	filtered := string(dump.filtered)
+	views := string(dump.views)
+
+	// the dummy view must be restored early so that the function referencing
+	// the view row type can be created
+	require.Contains(t, filtered, "CREATE VIEW public.circ_view AS\nSELECT\n    NULL::integer AS id,\n    NULL::text AS name;")
+	require.Contains(t, filtered, "CREATE FUNCTION public.circ_fn()")
+
+	// the real definitions are validated at creation time and are deferred
+	require.Contains(t, views, "CREATE OR REPLACE VIEW public.circ_view AS")
+	require.Contains(t, views, `CREATE RULE "_RETURN" AS`)
+	require.Contains(t, views, "CREATE VIEW public.regular_view AS")
+	require.NotContains(t, filtered, "CREATE OR REPLACE VIEW")
+	require.NotContains(t, filtered, "_RETURN")
+	require.NotContains(t, filtered, "regular_view")
+}
+
+func TestSnapshotGenerator_parseDumpRefreshesMaterializedViewsInCreationOrder(t *testing.T) {
+	t.Parallel()
+
+	dumpBytes := []byte(`\connect test_db
+
+CREATE MATERIALIZED VIEW public.base_mv AS
+ SELECT 1 AS id
+WITH NO DATA;
+
+CREATE MATERIALIZED VIEW public.dependent_mv AS
+ SELECT id
+   FROM public.base_mv
+WITH NO DATA;
+`)
+
+	dump := (&SnapshotGenerator{}).parseDump(dumpBytes)
+
+	refreshes := string(dump.materializedViewRefreshes)
+	require.Contains(t, refreshes, `\connect test_db`)
+	require.Less(t,
+		strings.Index(refreshes, "REFRESH MATERIALIZED VIEW public.base_mv WITH DATA;"),
+		strings.Index(refreshes, "REFRESH MATERIALIZED VIEW public.dependent_mv WITH DATA;"))
+}
+
+func TestSnapshotGenerator_CreateSnapshotRefreshesMaterializedViewsAfterViews(t *testing.T) {
+	t.Parallel()
+
+	testSchema := "test_schema"
+	schemaCreateDump := fmt.Appendf(nil, "CREATE SCHEMA IF NOT EXISTS %s;\n", pglib.QuoteIdentifier(testSchema))
+	schemaDump := []byte(`CREATE TABLE test_schema.example_source (
+    id bigint NOT NULL
+);
+
+CREATE MATERIALIZED VIEW test_schema.example_mv AS
+ SELECT id
+   FROM test_schema.example_source
+WITH NO DATA;
+
+CREATE UNIQUE INDEX example_mv_id_idx ON test_schema.example_mv USING btree (id);
+`)
+	restoreCalls := 0
+	conn := &mocks.Querier{
+		CloseFn: func(context.Context) error {
+			return nil
+		},
+	}
+
+	sg := SnapshotGenerator{
+		sourceURL:                "source-url",
+		targetURL:                "target-url",
+		sourceQuerier:            conn,
+		refreshMaterializedViews: true,
+		pgDumpFn: newMockPgdump(func(_ context.Context, i uint, po pglib.PGDumpOptions) ([]byte, error) {
+			require.Equal(t, uint(1), i)
+			require.Equal(t, "source-url", po.ConnectionString)
+			require.True(t, po.SchemaOnly)
+			require.Equal(t, []string{pglib.QuoteIdentifier(testSchema)}, po.Schemas)
+			return schemaDump, nil
+		}),
+		pgDumpAllFn: func(context.Context, pglib.PGDumpAllOptions) ([]byte, error) {
+			return nil, fmt.Errorf("pg_dumpall should not be called")
+		},
+		pgRestoreFn: func(_ context.Context, po pglib.PGRestoreOptions, dump []byte) (string, error) {
+			restoreCalls++
+			require.Equal(t, pglib.PGRestoreOptions{
+				ConnectionString: "target-url",
+				Format:           "p",
+			}, po)
+			switch restoreCalls {
+			case 1:
+				require.Equal(t, string(schemaCreateDump), string(dump))
+			case 2:
+				require.Contains(t, string(dump), "CREATE TABLE test_schema.example_source")
+				require.NotContains(t, string(dump), "CREATE MATERIALIZED VIEW")
+			case 3:
+				require.Contains(t, string(dump), "CREATE MATERIALIZED VIEW test_schema.example_mv")
+				require.Contains(t, string(dump), "CREATE UNIQUE INDEX example_mv_id_idx")
+				require.NotContains(t, string(dump), "REFRESH MATERIALIZED VIEW")
+			case 4:
+				require.Equal(t, "REFRESH MATERIALIZED VIEW test_schema.example_mv WITH DATA;\n\n", string(dump))
+			default:
+				return "", fmt.Errorf("unexpected call to pgrestoreFn: %d", restoreCalls)
+			}
+			return "", nil
+		},
+		logger:        log.NewNoopLogger(),
+		roleSQLParser: &roleSQLParser{},
+		optionGenerator: &optionGenerator{
+			sourceURL:         "source-url",
+			targetURL:         "target-url",
+			rolesSnapshotMode: roleSnapshotDisabled,
+			querier:           conn,
+		},
+	}
+
+	err := sg.CreateSnapshot(context.Background(), &snapshot.Snapshot{
+		SchemaTables: map[string][]string{
+			testSchema: {wildcard},
+		},
+	})
+
+	require.NoError(t, err)
+	require.Equal(t, 4, restoreCalls)
+}
+
+func TestSnapshotGenerator_CreateSnapshotSkipsMaterializedViewRefreshByDefault(t *testing.T) {
+	t.Parallel()
+
+	testSchema := "test_schema"
+	schemaCreateDump := fmt.Appendf(nil, "CREATE SCHEMA IF NOT EXISTS %s;\n", pglib.QuoteIdentifier(testSchema))
+	schemaDump := []byte(`CREATE TABLE test_schema.example_source (
+    id bigint NOT NULL
+);
+
+CREATE MATERIALIZED VIEW test_schema.example_mv AS
+ SELECT id
+   FROM test_schema.example_source
+WITH NO DATA;
+
+CREATE UNIQUE INDEX example_mv_id_idx ON test_schema.example_mv USING btree (id);
+`)
+	restoreCalls := 0
+	conn := &mocks.Querier{
+		CloseFn: func(context.Context) error {
+			return nil
+		},
+	}
+
+	sg := SnapshotGenerator{
+		sourceURL:     "source-url",
+		targetURL:     "target-url",
+		sourceQuerier: conn,
+		// refreshMaterializedViews defaults to false
+		pgDumpFn: newMockPgdump(func(_ context.Context, i uint, po pglib.PGDumpOptions) ([]byte, error) {
+			require.Equal(t, uint(1), i)
+			require.Equal(t, "source-url", po.ConnectionString)
+			require.True(t, po.SchemaOnly)
+			require.Equal(t, []string{pglib.QuoteIdentifier(testSchema)}, po.Schemas)
+			return schemaDump, nil
+		}),
+		pgDumpAllFn: func(context.Context, pglib.PGDumpAllOptions) ([]byte, error) {
+			return nil, fmt.Errorf("pg_dumpall should not be called")
+		},
+		pgRestoreFn: func(_ context.Context, po pglib.PGRestoreOptions, dump []byte) (string, error) {
+			restoreCalls++
+			require.NotContains(t, string(dump), "REFRESH MATERIALIZED VIEW")
+			switch restoreCalls {
+			case 1:
+				require.Equal(t, string(schemaCreateDump), string(dump))
+			case 2:
+				require.Contains(t, string(dump), "CREATE TABLE test_schema.example_source")
+				require.NotContains(t, string(dump), "CREATE MATERIALIZED VIEW")
+			case 3:
+				require.Contains(t, string(dump), "CREATE MATERIALIZED VIEW test_schema.example_mv")
+				require.Contains(t, string(dump), "CREATE UNIQUE INDEX example_mv_id_idx")
+			default:
+				return "", fmt.Errorf("unexpected call to pgrestoreFn: %d", restoreCalls)
+			}
+			return "", nil
+		},
+		logger:        log.NewNoopLogger(),
+		roleSQLParser: &roleSQLParser{},
+		optionGenerator: &optionGenerator{
+			sourceURL:         "source-url",
+			targetURL:         "target-url",
+			rolesSnapshotMode: roleSnapshotDisabled,
+			querier:           conn,
+		},
+	}
+
+	err := sg.CreateSnapshot(context.Background(), &snapshot.Snapshot{
+		SchemaTables: map[string][]string{
+			testSchema: {wildcard},
+		},
+	})
+
+	require.NoError(t, err)
+	require.Equal(t, 3, restoreCalls)
+}
+
+func TestGetDumpsDiff(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		d1   []byte
+		d2   []byte
+		want []byte
+	}{
+		{
+			name: "empty dumps",
+			d1:   []byte{},
+			d2:   []byte{},
+			want: []byte{},
+		},
+		{
+			name: "identical dumps",
+			d1:   []byte("line1\nline2\nline3"),
+			d2:   []byte("line1\nline2\nline3"),
+			want: []byte{},
+		},
+		{
+			name: "first dump has extra lines",
+			d1:   []byte("line1\nline2\nline3\nline4"),
+			d2:   []byte("line1\nline2\nline3"),
+			want: []byte("line4\n"),
+		},
+		{
+			name: "second dump has extra lines",
+			d1:   []byte("line1\nline2\nline3"),
+			d2:   []byte("line1\nline2\nline3\nline4"),
+			want: []byte{},
+		},
+		{
+			name: "completely different dumps",
+			d1:   []byte("lineA\nlineB\nlineC"),
+			d2:   []byte("line1\nline2\nline3"),
+			want: []byte("lineA\nlineB\nlineC\n"),
+		},
+		{
+			name: "partially different dumps",
+			d1:   []byte("line1\nline2\nlineC\nlineD"),
+			d2:   []byte("line1\nline2\nline3"),
+			want: []byte("lineC\nlineD\n"),
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := getDumpsDiff(tc.d1, tc.d2)
+			require.Equal(t, string(tc.want), string(got))
+		})
+	}
+}
+
+func TestSnapshotGenerator_removeRestrictedRoleAttributes(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name  string
+		line  string
+		isAWS bool
+
+		wantLine string
+	}{
+		{
+			name:     "no replication attribute - no change",
+			line:     "CREATE ROLE test_role SUPERUSER CREATEDB;",
+			wantLine: "CREATE ROLE test_role SUPERUSER CREATEDB;",
+		},
+		{
+			name:     "replication attribute on non-AWS target - no change",
+			line:     "CREATE ROLE test_role REPLICATION SUPERUSER;",
+			wantLine: "CREATE ROLE test_role REPLICATION SUPERUSER;",
+		},
+		{
+			name:     "replication attribute on AWS target - removed and grant added",
+			line:     "CREATE ROLE test_role REPLICATION SUPERUSER;",
+			isAWS:    true,
+			wantLine: "CREATE ROLE test_role SUPERUSER;\nGRANT rds_replication TO test_role;",
+		},
+		{
+			name:     "replication in role name - not affected",
+			line:     "CREATE ROLE replication_user SUPERUSER;",
+			wantLine: "CREATE ROLE replication_user SUPERUSER;",
+		},
+		{
+			name:     "quoted role name with replication attribute on AWS",
+			line:     "CREATE ROLE \"test_role\" REPLICATION LOGIN;",
+			isAWS:    true,
+			wantLine: "CREATE ROLE \"test_role\" LOGIN;\nGRANT rds_replication TO \"test_role\";",
+		},
+		{
+			name:     "alter role with replication on AWS",
+			line:     "ALTER ROLE existing_role REPLICATION CREATEDB;",
+			isAWS:    true,
+			wantLine: "ALTER ROLE existing_role CREATEDB;\nGRANT rds_replication TO existing_role;",
+		},
+		{
+			name:     "no role name found - no grant added",
+			line:     "COMMENT ON ROLE REPLICATION;",
+			wantLine: "COMMENT ON ROLE;",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			sg := SnapshotGenerator{
+				roleSQLParser: &roleSQLParser{},
+				targetURL: func(isAWS bool) string {
+					if isAWS {
+						return "test.url.rds.amazonaws.com"
+					}
+					return "test.url"
+				}(tc.isAWS),
+			}
+
+			sg.removeRestrictedRoleAttributes(tc.line)
+		})
+	}
+}
+
+func TestSnapshotGenerator_filterTriggers(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name            string
+		input           string
+		excludedSchemas []string
+		want            string
+	}{
+		{
+			name:            "filters triggers from excluded schema",
+			input:           "CREATE EVENT TRIGGER trigger1 ON ddl_command_end EXECUTE FUNCTION schema1.function1();\nCREATE EVENT TRIGGER trigger2 ON sql_drop EXECUTE FUNCTION excluded_schema.function2();",
+			excludedSchemas: []string{"\"excluded_schema\""},
+			want:            "CREATE EVENT TRIGGER trigger1 ON ddl_command_end EXECUTE FUNCTION schema1.function1();\n",
+		},
+		{
+			name:            "keeps all triggers when no schema excluded",
+			input:           "CREATE EVENT TRIGGER trigger1 ON ddl_command_end EXECUTE FUNCTION schema1.function1();\nCREATE EVENT TRIGGER trigger2 ON sql_drop EXECUTE FUNCTION excluded_schema.function2();",
+			excludedSchemas: []string{},
+			want:            "CREATE EVENT TRIGGER trigger1 ON ddl_command_end EXECUTE FUNCTION schema1.function1();\nCREATE EVENT TRIGGER trigger2 ON sql_drop EXECUTE FUNCTION excluded_schema.function2();",
+		},
+		{
+			name:            "malformed trigger line - skipped",
+			input:           "INVALID TRIGGER LINE\nCREATE EVENT TRIGGER trigger2 ON sql_drop EXECUTE FUNCTION schema2.function2();",
+			excludedSchemas: []string{"\"schema2\""},
+			want:            "",
+		},
+		{
+			name:            "exclude trigger with function parameters",
+			input:           "CREATE EVENT TRIGGER trigger1 ON ddl_command_end EXECUTE FUNCTION schema1.function1('param1', 'param2');\n",
+			excludedSchemas: []string{"\"schema1\""},
+			want:            "",
+		},
+		{
+			name:            "excludes multiple triggers from different excluded schemas",
+			input:           "CREATE EVENT TRIGGER trigger1 ON ddl_command_end EXECUTE FUNCTION schema1.function1();\nCREATE EVENT TRIGGER trigger2 ON sql_drop EXECUTE FUNCTION excluded1.function2();\nCREATE EVENT TRIGGER trigger3 ON ddl_command_start EXECUTE FUNCTION excluded2.function3();\nCREATE EVENT TRIGGER trigger4 ON sql_drop EXECUTE FUNCTION schema2.function4();",
+			excludedSchemas: []string{"\"excluded1\"", "\"excluded2\""},
+			want:            "CREATE EVENT TRIGGER trigger1 ON ddl_command_end EXECUTE FUNCTION schema1.function1();\nCREATE EVENT TRIGGER trigger4 ON sql_drop EXECUTE FUNCTION schema2.function4();\n",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			s := &SnapshotGenerator{}
+
+			got := s.filterTriggers([]byte(tc.input), tc.excludedSchemas)
+			require.Equal(t, string(tc.want), string(got))
+		})
+	}
+}
+
+func TestCaptureScope(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name        string
+		dumpSchemas map[string][]string
+
+		wantSchemas []string
+		wantTables  []string
+	}{
+		{
+			name:        "explicit schemas and tables",
+			dumpSchemas: map[string][]string{"a": {"t1", "t2"}, "b": {"t3"}},
+			wantSchemas: []string{"a", "b"},
+			wantTables:  []string{"t1", "t2", "t3"},
+		},
+		{
+			// a wildcard on one schema drops the table filter for all of them:
+			// the names behind it are only resolved later, by the table finder
+			wantSchemas: []string{"a", "b"},
+			name:        "one schema has a wildcard table",
+			dumpSchemas: map[string][]string{"a": {"t1"}, "b": {wildcard}},
+			wantTables:  nil,
+		},
+		{
+			name:        "wildcard schema keeps the table filter",
+			dumpSchemas: map[string][]string{wildcard: {"t1"}},
+			wantSchemas: nil,
+			wantTables:  []string{"t1"},
+		},
+		{
+			name:        "wildcard on both sides filters nothing",
+			dumpSchemas: map[string][]string{wildcard: {wildcard}},
+			wantSchemas: nil,
+			wantTables:  nil,
+		},
+		{
+			name:        "empty scope",
+			dumpSchemas: map[string][]string{},
+			wantSchemas: []string{},
+			wantTables:  nil,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			// map iteration order is random, so compare as sets
+			schemas, tables := captureScope(tc.dumpSchemas)
+			require.ElementsMatch(t, tc.wantSchemas, schemas)
+			require.ElementsMatch(t, tc.wantTables, tables)
+			if tc.wantTables == nil {
+				require.Nil(t, tables, "a nil table filter means no filter; empty would match nothing")
+			}
+			if tc.wantSchemas == nil {
+				require.Nil(t, schemas, "a nil schema filter means no filter; empty would match nothing")
+			}
+		})
+	}
+}
+
+// captureLogger records Warn calls so a test can assert on advisory output.
+type captureLogger struct {
+	log.Logger
+	warnings   []string
+	warnFields []log.Fields
+}
+
+func (l *captureLogger) Warn(err error, msg string, fields ...log.Fields) {
+	l.warnings = append(l.warnings, msg)
+	if len(fields) > 0 {
+		l.warnFields = append(l.warnFields, fields[0])
+	} else {
+		l.warnFields = append(l.warnFields, nil)
+	}
+}
+
+func TestWarnOnCaptureDrift(t *testing.T) {
+	t.Parallel()
+
+	testSchema, testTable := "test_schema", "test_table"
+	dumpSchemas := map[string][]string{testSchema: {testTable}}
+	captured := pglib.SchemaTableColumns{testSchema: {testTable: {"id"}}}
+
+	// what the source reports after the dump, i.e. the second read
+	newQuerier := func(afterDump pglib.SchemaTableColumns) *mocks.Querier {
+		return &mocks.Querier{
+			QueryFn: func(ctx context.Context, _ uint, query string, args ...any) (pglib.Rows, error) {
+				require.Equal(t, pglib.DiscoverTableColumnsQuery, query)
+				rows := []struct{ schema, table, column string }{}
+				for schema, tables := range afterDump {
+					for table, columns := range tables {
+						for _, column := range columns {
+							rows = append(rows, struct{ schema, table, column string }{schema, table, column})
+						}
+					}
+				}
+				return &mocks.Rows{
+					CloseFn: func() {},
+					NextFn:  func(i uint) bool { return int(i) <= len(rows) },
+					ScanFn: func(i uint, dest ...any) error {
+						require.Len(t, dest, 3)
+						r := rows[i-1]
+						schema, ok := dest[0].(*string)
+						require.True(t, ok)
+						table, ok := dest[1].(*string)
+						require.True(t, ok)
+						column, ok := dest[2].(*string)
+						require.True(t, ok)
+						*schema, *table, *column = r.schema, r.table, r.column
+						return nil
+					},
+					ErrFn: func() error { return nil },
+				}, nil
+			},
+		}
+	}
+
+	tests := []struct {
+		name      string
+		afterDump pglib.SchemaTableColumns
+		wantWarn  bool
+	}{
+		{
+			name:      "no drift is silent",
+			afterDump: pglib.SchemaTableColumns{testSchema: {testTable: {"id"}}},
+			wantWarn:  false,
+		},
+		{
+			name:      "a column added during the dump warns",
+			afterDump: pglib.SchemaTableColumns{testSchema: {testTable: {"id", "added"}}},
+			wantWarn:  true,
+		},
+		{
+			name:      "a column dropped during the dump warns",
+			afterDump: pglib.SchemaTableColumns{testSchema: {testTable: {}}},
+			wantWarn:  true,
+		},
+		{
+			name:      "a table created during the dump warns",
+			afterDump: pglib.SchemaTableColumns{testSchema: {testTable: {"id"}, "new_table": {"id"}}},
+			wantWarn:  true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			logger := &captureLogger{Logger: log.NewNoopLogger()}
+			sg := SnapshotGenerator{sourceQuerier: newQuerier(tc.afterDump), logger: logger}
+
+			ss := &snapshot.Snapshot{TableColumns: pglib.SchemaTableColumns{testSchema: {testTable: {"id"}}}}
+			sg.warnOnCaptureDrift(context.Background(), ss, dumpSchemas)
+
+			// advisory only: the pinned columns are never rewritten by drift,
+			// and nothing here can fail the snapshot
+			require.Equal(t, captured, ss.TableColumns)
+			require.Equal(t, tc.wantWarn, len(logger.warnings) > 0, "warnings: %v", logger.warnings)
+		})
+	}
+}
+
+func TestSnapshotGenerator_restoreIndicesAndConstraints(t *testing.T) {
+	t.Parallel()
+
+	errTest := errors.New("oh noes")
+	indexDump := []byte("CREATE INDEX a;\n\n")
+	transientErr := func() error {
+		return pglib.NewPGRestoreErrors(&pglib.ErrTransientFailure{
+			Details: "psql: error: connection to server was lost",
+		})
+	}
+
+	tests := []struct {
+		name string
+		// restoreErrs holds the error returned by each restore attempt. Once
+		// the list is exhausted, the last entry is returned again.
+		restoreErrs []error
+
+		wantAttempts int
+		wantErr      error
+	}{
+		{
+			name:         "ok",
+			restoreErrs:  []error{nil},
+			wantAttempts: 1,
+			wantErr:      nil,
+		},
+		{
+			name:         "ok - transient error cleared on retry",
+			restoreErrs:  []error{transientErr(), nil},
+			wantAttempts: 2,
+			wantErr:      nil,
+		},
+		{
+			name:         "ok - ignored errors are not retried",
+			restoreErrs:  []error{pglib.NewPGRestoreErrors(&pglib.ErrRelationAlreadyExists{})},
+			wantAttempts: 1,
+			wantErr:      nil,
+		},
+		{
+			name:         "error - transient error outlasts the retries",
+			restoreErrs:  []error{transientErr()},
+			wantAttempts: 3,
+			wantErr:      transientErr(),
+		},
+		{
+			name:         "error - critical error is not retried",
+			restoreErrs:  []error{pglib.NewPGRestoreErrors(errTest)},
+			wantAttempts: 1,
+			wantErr:      pglib.NewPGRestoreErrors(errTest),
+		},
+		{
+			name:         "error - critical error alongside a transient one is not retried",
+			restoreErrs:  []error{pglib.NewPGRestoreErrors(errTest, &pglib.ErrTransientFailure{})},
+			wantAttempts: 1,
+			wantErr:      pglib.NewPGRestoreErrors(errTest, &pglib.ErrTransientFailure{}),
+		},
+		{
+			name:         "error - unparsed restore error is not retried",
+			restoreErrs:  []error{errTest},
+			wantAttempts: 1,
+			wantErr:      errTest,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			attempts := 0
+			sg := SnapshotGenerator{
+				targetURL:       "target-url",
+				logger:          log.NewNoopLogger(),
+				optionGenerator: &optionGenerator{targetURL: "target-url"},
+				pgRestoreFn: func(_ context.Context, _ pglib.PGRestoreOptions, dump []byte) (string, error) {
+					require.Equal(t, string(indexDump), string(dump))
+					attempts++
+					if attempts > len(tc.restoreErrs) {
+						return "", tc.restoreErrs[len(tc.restoreErrs)-1]
+					}
+					return "", tc.restoreErrs[attempts-1]
+				},
+				indexRestoreBackoff: backoff.NewProvider(&backoff.Config{
+					Constant: &backoff.ConstantConfig{
+						Interval:   time.Millisecond,
+						MaxRetries: 2,
+					},
+				}),
+			}
+
+			err := sg.restoreIndicesAndConstraints(context.Background(), indexDump, &snapshot.Snapshot{})
+			if !errors.Is(err, tc.wantErr) {
+				require.Equal(t, tc.wantErr, err)
+			}
+			require.Equal(t, tc.wantAttempts, attempts)
+		})
+	}
+}
+
+func TestSnapshotGenerator_restoreIndicesAndConstraints_noBackoffProvider(t *testing.T) {
+	t.Parallel()
+
+	indexDump := []byte("CREATE INDEX a;\n\n")
+	attempts := 0
+	sg := SnapshotGenerator{
+		targetURL:       "target-url",
+		logger:          log.NewNoopLogger(),
+		optionGenerator: &optionGenerator{targetURL: "target-url"},
+		pgRestoreFn: func(_ context.Context, _ pglib.PGRestoreOptions, _ []byte) (string, error) {
+			attempts++
+			return "", pglib.NewPGRestoreErrors(&pglib.ErrTransientFailure{})
+		},
+	}
+
+	err := sg.restoreIndicesAndConstraints(context.Background(), indexDump, &snapshot.Snapshot{})
+	require.Error(t, err)
+	require.Equal(t, 1, attempts)
+}
+
+func TestPartitionDumpBlocks(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name              string
+		dump              []byte
+		wantConnectBlocks []string
+		wantIndexBlocks   []string
+		wantOtherBlocks   []string
+	}{
+		{
+			name: "empty dump",
+		},
+		{
+			name: "mixed statements",
+			dump: []byte("\\connect testdb\n\n" +
+				"CREATE INDEX idx_a ON public.a USING btree (id);\n\n" +
+				"CREATE UNIQUE INDEX idx_b ON public.b USING btree (id);\n\n" +
+				"ALTER TABLE public.a ADD CONSTRAINT a_pkey PRIMARY KEY USING INDEX idx_a;\n\n" +
+				"COMMENT ON INDEX idx_b IS 'test';\n\n"),
+			wantConnectBlocks: []string{`\connect testdb`},
+			wantIndexBlocks: []string{
+				"CREATE INDEX idx_a ON public.a USING btree (id);",
+				"CREATE UNIQUE INDEX idx_b ON public.b USING btree (id);",
+			},
+			wantOtherBlocks: []string{
+				"ALTER TABLE public.a ADD CONSTRAINT a_pkey PRIMARY KEY USING INDEX idx_a;",
+				"COMMENT ON INDEX idx_b IS 'test';",
+			},
+		},
+		{
+			// ATTACH PARTITION depends on both the parent and the child index
+			// already existing, so it must not be treated as an independent
+			// index statement.
+			name: "attach partition is not an index statement",
+			dump: []byte("CREATE INDEX events_partition_id_idx ON ONLY public.events USING btree (partition_id);\n\n" +
+				"CREATE INDEX events_0_partition_id_idx ON public.events_0 USING btree (partition_id);\n\n" +
+				"ALTER INDEX public.events_partition_id_idx ATTACH PARTITION public.events_0_partition_id_idx;\n\n"),
+			wantIndexBlocks: []string{
+				"CREATE INDEX events_partition_id_idx ON ONLY public.events USING btree (partition_id);",
+				"CREATE INDEX events_0_partition_id_idx ON public.events_0 USING btree (partition_id);",
+			},
+			wantOtherBlocks: []string{
+				"ALTER INDEX public.events_partition_id_idx ATTACH PARTITION public.events_0_partition_id_idx;",
+			},
+		},
+		{
+			// pg_dump splits an ALTER TABLE ONLY constraint over two lines,
+			// which parseDump keeps together in a single block
+			name: "multi line constraint stays one block",
+			dump: []byte("CREATE INDEX idx_a ON public.a USING btree (id);\n\n" +
+				"ALTER TABLE ONLY public.a\n    ADD CONSTRAINT a_fkey FOREIGN KEY (b_id) REFERENCES public.b(id);\n\n"),
+			wantIndexBlocks: []string{"CREATE INDEX idx_a ON public.a USING btree (id);"},
+			wantOtherBlocks: []string{"ALTER TABLE ONLY public.a\n    ADD CONSTRAINT a_fkey FOREIGN KEY (b_id) REFERENCES public.b(id);"},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			gotConnect, gotIndex, gotOther := partitionDumpBlocks(tc.dump, isIndexStatement)
+			require.Equal(t, tc.wantConnectBlocks, gotConnect)
+			require.Equal(t, tc.wantIndexBlocks, gotIndex)
+			require.Equal(t, tc.wantOtherBlocks, gotOther)
+		})
+	}
+}
+
+const (
+	testConnectBlock = `\connect testdb`
+	testIndexA       = "CREATE INDEX idx_a ON public.a USING btree (id);"
+	testIndexB       = "CREATE UNIQUE INDEX idx_b ON public.b USING btree (id);"
+	testDependent1   = "ALTER TABLE public.a ADD CONSTRAINT a_pkey PRIMARY KEY USING INDEX idx_a;"
+	testDependent2   = "COMMENT ON INDEX idx_b IS 'test';"
+)
+
+func testIndexDump(blocks ...string) []byte {
+	return []byte(strings.Join(blocks, "\n\n") + "\n\n")
+}
+
+// restoreRecorder records the dumps a restore was called with, so that the
+// assertions can run on the test goroutine: testify's require calls FailNow,
+// which must not be reached from the restore worker goroutines.
+type restoreRecorder struct {
+	mutex sync.Mutex
+	dumps []string
+}
+
+func (r *restoreRecorder) record(dump []byte) {
+	r.mutex.Lock()
+	defer r.mutex.Unlock()
+	r.dumps = append(r.dumps, string(dump))
+}
+
+func (r *restoreRecorder) recorded() []string {
+	r.mutex.Lock()
+	defer r.mutex.Unlock()
+	return slices.Clone(r.dumps)
+}
+
+func TestSnapshotGenerator_restoreIndexDump(t *testing.T) {
+	t.Parallel()
+
+	dump := testIndexDump(testConnectBlock, testIndexA, testIndexB, testDependent1, testDependent2)
+	indexACall := string(testIndexDump(testConnectBlock, testIndexA))
+	indexBCall := string(testIndexDump(testConnectBlock, testIndexB))
+	dependentsCall := string(testIndexDump(testConnectBlock, testDependent1, testDependent2))
+
+	transientErr := func() error {
+		return pglib.NewPGRestoreErrors(&pglib.ErrTransientFailure{Details: "psql: error: connection to server was lost"})
+	}
+
+	t.Run("no workers configured restores the whole dump in one call", func(t *testing.T) {
+		t.Parallel()
+
+		recorder := &restoreRecorder{}
+		sg := &SnapshotGenerator{
+			logger: log.NewNoopLogger(),
+			pgRestoreFn: func(_ context.Context, _ pglib.PGRestoreOptions, gotDump []byte) (string, error) {
+				recorder.record(gotDump)
+				return "", nil
+			},
+		}
+
+		require.NoError(t, sg.restoreIndexDump(context.Background(), pglib.PGRestoreOptions{}, dump))
+		require.Equal(t, []string{string(dump)}, recorder.recorded())
+	})
+
+	t.Run("a single index statement falls back to one sequential call", func(t *testing.T) {
+		t.Parallel()
+
+		singleIndexDump := testIndexDump(testIndexA, testDependent1)
+		recorder := &restoreRecorder{}
+		sg := &SnapshotGenerator{
+			logger:              log.NewNoopLogger(),
+			indexRestoreWorkers: 4,
+			pgRestoreFn: func(_ context.Context, _ pglib.PGRestoreOptions, gotDump []byte) (string, error) {
+				recorder.record(gotDump)
+				return "", nil
+			},
+		}
+
+		require.NoError(t, sg.restoreIndexDump(context.Background(), pglib.PGRestoreOptions{}, singleIndexDump))
+		require.Equal(t, []string{string(singleIndexDump)}, recorder.recorded())
+	})
+
+	t.Run("each index is restored on its own, and the dependent statements after all of them", func(t *testing.T) {
+		t.Parallel()
+
+		recorder := &restoreRecorder{}
+		sg := &SnapshotGenerator{
+			logger:              log.NewNoopLogger(),
+			indexRestoreWorkers: 2,
+			pgRestoreFn: func(_ context.Context, _ pglib.PGRestoreOptions, gotDump []byte) (string, error) {
+				recorder.record(gotDump)
+				return "", nil
+			},
+		}
+
+		require.NoError(t, sg.restoreIndexDump(context.Background(), pglib.PGRestoreOptions{}, dump))
+
+		recorded := recorder.recorded()
+		require.Len(t, recorded, 3)
+		// the indices are restored one statement per call, in any order,
+		// each carrying the connect statements
+		require.ElementsMatch(t, []string{indexACall, indexBCall}, recorded[:2])
+		// the dependent statements are restored last, in one call, in their
+		// original relative order
+		require.Equal(t, dependentsCall, recorded[2])
+	})
+
+	t.Run("more workers than index statements", func(t *testing.T) {
+		t.Parallel()
+
+		recorder := &restoreRecorder{}
+		sg := &SnapshotGenerator{
+			logger:              log.NewNoopLogger(),
+			indexRestoreWorkers: 8,
+			pgRestoreFn: func(_ context.Context, _ pglib.PGRestoreOptions, gotDump []byte) (string, error) {
+				recorder.record(gotDump)
+				return "", nil
+			},
+		}
+
+		require.NoError(t, sg.restoreIndexDump(context.Background(), pglib.PGRestoreOptions{}, dump))
+
+		recorded := recorder.recorded()
+		require.Len(t, recorded, 3)
+		require.ElementsMatch(t, []string{indexACall, indexBCall}, recorded[:2])
+		require.Equal(t, dependentsCall, recorded[2])
+	})
+
+	t.Run("indices are restored concurrently", func(t *testing.T) {
+		t.Parallel()
+
+		// both index restores block until the other one has started, so the
+		// test times out rather than passing if the restores are serialised
+		started := make(chan struct{}, 2)
+		release := make(chan struct{})
+		sg := &SnapshotGenerator{
+			logger:              log.NewNoopLogger(),
+			indexRestoreWorkers: 2,
+			pgRestoreFn: func(_ context.Context, _ pglib.PGRestoreOptions, gotDump []byte) (string, error) {
+				if !isIndexStatement(strings.TrimPrefix(string(gotDump), testConnectBlock+"\n\n")) {
+					return "", nil
+				}
+				started <- struct{}{}
+				<-release
+				return "", nil
+			},
+		}
+
+		done := make(chan error, 1)
+		go func() { done <- sg.restoreIndexDump(context.Background(), pglib.PGRestoreOptions{}, dump) }()
+
+		for range 2 {
+			select {
+			case <-started:
+			case <-time.After(10 * time.Second):
+				t.Fatal("timed out waiting for both index restores to start: they are not running concurrently")
+			}
+		}
+		close(release)
+
+		select {
+		case err := <-done:
+			require.NoError(t, err)
+		case <-time.After(10 * time.Second):
+			t.Fatal("timed out waiting for the restore to finish")
+		}
+	})
+
+	t.Run("a failing index does not stop the other indices or the dependent statements", func(t *testing.T) {
+		t.Parallel()
+
+		errTest := errors.New("oh noes")
+		recorder := &restoreRecorder{}
+		sg := &SnapshotGenerator{
+			logger:              log.NewNoopLogger(),
+			indexRestoreWorkers: 2,
+			pgRestoreFn: func(_ context.Context, _ pglib.PGRestoreOptions, gotDump []byte) (string, error) {
+				recorder.record(gotDump)
+				if string(gotDump) == indexACall {
+					return "", errTest
+				}
+				return "", nil
+			},
+		}
+
+		err := sg.restoreIndexDump(context.Background(), pglib.PGRestoreOptions{}, dump)
+		require.ErrorIs(t, err, errTest)
+
+		// cancelling the sibling restores would orphan the index builds they
+		// have already started on the server, and skipping the dependent
+		// statements would leave the target without its constraints
+		recorded := recorder.recorded()
+		require.Len(t, recorded, 3)
+		require.ElementsMatch(t, []string{indexACall, indexBCall}, recorded[:2])
+		require.Equal(t, dependentsCall, recorded[2])
+	})
+
+	t.Run("a wave of transient failures stays retryable", func(t *testing.T) {
+		t.Parallel()
+
+		sg := &SnapshotGenerator{
+			logger:              log.NewNoopLogger(),
+			indexRestoreWorkers: 2,
+			pgRestoreFn: func(_ context.Context, _ pglib.PGRestoreOptions, gotDump []byte) (string, error) {
+				if isIndexStatement(strings.TrimPrefix(string(gotDump), testConnectBlock+"\n\n")) {
+					return "", transientErr()
+				}
+				return "", nil
+			},
+		}
+
+		err := sg.restoreIndexDump(context.Background(), pglib.PGRestoreOptions{}, dump)
+		require.Error(t, err)
+
+		// the merged error decides the retry for the whole wave, rather than
+		// whichever worker's error arrived first
+		restoreErrs := &pglib.PGRestoreErrors{}
+		require.ErrorAs(t, err, &restoreErrs)
+		require.True(t, restoreErrs.IsRetryable())
+		require.Len(t, restoreErrs.GetRetryableErrors(), 2)
+	})
+
+	t.Run("a critical failure alongside a transient one is not retryable", func(t *testing.T) {
+		t.Parallel()
+
+		sg := &SnapshotGenerator{
+			logger:              log.NewNoopLogger(),
+			indexRestoreWorkers: 2,
+			pgRestoreFn: func(_ context.Context, _ pglib.PGRestoreOptions, gotDump []byte) (string, error) {
+				switch string(gotDump) {
+				case indexACall:
+					return "", transientErr()
+				case indexBCall:
+					return "", pglib.NewPGRestoreErrors(errors.New("oh noes"))
+				default:
+					return "", nil
+				}
+			},
+		}
+
+		err := sg.restoreIndexDump(context.Background(), pglib.PGRestoreOptions{}, dump)
+		require.Error(t, err)
+
+		restoreErrs := &pglib.PGRestoreErrors{}
+		require.ErrorAs(t, err, &restoreErrs)
+		require.False(t, restoreErrs.IsRetryable())
+		require.True(t, restoreErrs.HasCriticalErrors())
+	})
+
+	t.Run("a cancelled context stops the restore before the dependent statements", func(t *testing.T) {
+		t.Parallel()
+
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+
+		recorder := &restoreRecorder{}
+		sg := &SnapshotGenerator{
+			logger:              log.NewNoopLogger(),
+			indexRestoreWorkers: 2,
+			pgRestoreFn: func(_ context.Context, _ pglib.PGRestoreOptions, gotDump []byte) (string, error) {
+				recorder.record(gotDump)
+				return "", nil
+			},
+		}
+
+		err := sg.restoreIndexDump(ctx, pglib.PGRestoreOptions{}, dump)
+		require.ErrorIs(t, err, context.Canceled)
+		require.Empty(t, recorder.recorded())
+	})
+
+	t.Run("the progress tracking path restores every block too", func(t *testing.T) {
+		t.Parallel()
+
+		recorder := &restoreRecorder{}
+		tracked := make(chan struct{})
+		sg := &SnapshotGenerator{
+			logger:              log.NewNoopLogger(),
+			indexRestoreWorkers: 2,
+			snapshotTracker: &mockSnapshotTracker{
+				trackIndexesCreationFn: func(ctx context.Context) {
+					close(tracked)
+					<-ctx.Done()
+				},
+			},
+			pgRestoreFn: func(_ context.Context, _ pglib.PGRestoreOptions, gotDump []byte) (string, error) {
+				recorder.record(gotDump)
+				return "", nil
+			},
+		}
+
+		require.NoError(t, sg.restoreIndices(context.Background(), pglib.PGRestoreOptions{}, dump))
+		<-tracked
+
+		recorded := recorder.recorded()
+		require.Len(t, recorded, 3)
+		require.ElementsMatch(t, []string{indexACall, indexBCall}, recorded[:2])
+		require.Equal(t, dependentsCall, recorded[2])
+	})
+}
+
+func TestConfig_indexRestoreWorkers(t *testing.T) {
+	t.Parallel()
+
+	require.Equal(t, uint(1), (&Config{}).indexRestoreWorkers())
+	require.Equal(t, uint(3), (&Config{IndexRestoreWorkers: 3}).indexRestoreWorkers())
+}
+
+func TestNewSnapshotGenerator_indexRestoreWorkersValidation(t *testing.T) {
+	t.Parallel()
+
+	// the worker count is validated before any connection is opened, so an
+	// unusable value fails at startup instead of at the index restore, hours
+	// into a snapshot
+	_, err := NewSnapshotGenerator(context.Background(), &Config{
+		SourcePGURL:         "postgres://not-used",
+		IndexRestoreWorkers: maxIndexRestoreWorkers + 1,
+	})
+	require.ErrorIs(t, err, errTooManyIndexRestoreWorkers)
+
+	// a negative value that wrapped around on its way through the config
+	// decoder is caught by the same cap
+	_, err = NewSnapshotGenerator(context.Background(), &Config{
+		SourcePGURL:         "postgres://not-used",
+		IndexRestoreWorkers: ^uint(0),
+	})
+	require.ErrorIs(t, err, errTooManyIndexRestoreWorkers)
+}
+
+// TestSnapshotGenerator_restoreIndicesAndConstraints_parallel covers the
+// interaction between the concurrent index restore and the retry wrapper: a
+// transient failure in any worker has to be classified as retryable for the
+// whole wave, and the rerun has to succeed once the objects the first attempt
+// did create come back as "already exists".
+func TestSnapshotGenerator_restoreIndicesAndConstraints_parallel(t *testing.T) {
+	t.Parallel()
+
+	dump := testIndexDump(testIndexA, testIndexB, testDependent1)
+	indexACall := string(testIndexDump(testIndexA))
+	indexBCall := string(testIndexDump(testIndexB))
+
+	attempts := atomic.Int32{}
+	sg := SnapshotGenerator{
+		targetURL:           "target-url",
+		logger:              log.NewNoopLogger(),
+		optionGenerator:     &optionGenerator{targetURL: "target-url"},
+		indexRestoreWorkers: 2,
+		indexRestoreBackoff: backoff.NewProvider(&backoff.Config{
+			Constant: &backoff.ConstantConfig{
+				Interval:   time.Millisecond,
+				MaxRetries: 2,
+			},
+		}),
+		pgRestoreFn: func(_ context.Context, _ pglib.PGRestoreOptions, gotDump []byte) (string, error) {
+			got := string(gotDump)
+			if got != indexACall && got != indexBCall {
+				return "", nil
+			}
+			// the first attempt loses its connection on both indices, the
+			// second finds idx_a already there from the first one
+			if attempts.Add(1) <= 2 {
+				return "", pglib.NewPGRestoreErrors(&pglib.ErrTransientFailure{
+					Details: "psql: error: connection to server was lost",
+				})
+			}
+			return "", pglib.NewPGRestoreErrors(&pglib.ErrRelationAlreadyExists{
+				Details: `ERROR: relation "idx_a" already exists`,
+			})
+		},
+	}
+
+	require.NoError(t, sg.restoreIndicesAndConstraints(context.Background(), dump, &snapshot.Snapshot{}))
+	// both indices on the first attempt, both again on the retry
+	require.Equal(t, int32(4), attempts.Load())
+}
+
+func TestSnapshotGenerator_summariseIgnored(t *testing.T) {
+	t.Parallel()
+
+	attach := &pglib.ErrRestoreStatement{
+		Err:  &pglib.ErrRelationDoesNotExist{Details: `ERROR:  relation "parent_idx" does not exist`},
+		Echo: "STATEMENT:  ALTER INDEX public.parent_idx ATTACH PARTITION public.child_idx;",
+	}
+	exists := &pglib.ErrRestoreStatement{
+		Err:  &pglib.ErrRelationAlreadyExists{Details: `ERROR:  relation "users" already exists`},
+		Echo: "Command was: CREATE TABLE public.users (id integer);",
+	}
+	// pg_restore does not always echo the statement, and the summary still has
+	// to say something useful about that error rather than leave a blank row
+	noEcho := &pglib.ErrPermissionDenied{Details: "ERROR:  permission denied for schema public"}
+
+	t.Run("nothing ignored says nothing", func(t *testing.T) {
+		t.Parallel()
+
+		logger := &captureLogger{Logger: log.NewNoopLogger()}
+		g := &SnapshotGenerator{logger: logger}
+
+		g.summariseIgnored()
+
+		require.Empty(t, logger.warnings)
+	})
+
+	t.Run("reports every pass together", func(t *testing.T) {
+		t.Parallel()
+
+		logger := &captureLogger{Logger: log.NewNoopLogger()}
+		g := &SnapshotGenerator{logger: logger}
+
+		g.recordIgnored(phaseSchema, []error{attach})
+		g.recordIgnored(phaseIndicesAndConstraints, []error{exists, noEcho})
+		g.summariseIgnored()
+
+		require.Equal(t, []string{"restore summary: 3 statements were not applied"}, logger.warnings)
+		require.Len(t, logger.warnFields, 1)
+
+		require.Equal(t,
+			map[string]int{phaseSchema: 1, phaseIndicesAndConstraints: 2},
+			logger.warnFields[0]["by_phase"])
+
+		require.Equal(t, []map[string]string{
+			{
+				"phase":     phaseSchema,
+				"reason":    "relation does not exist",
+				"statement": "ALTER INDEX public.parent_idx ATTACH PARTITION public.child_idx;",
+			},
+			{
+				"phase":     phaseIndicesAndConstraints,
+				"reason":    "relation already exists",
+				"statement": "CREATE TABLE public.users (id integer);",
+			},
+			{
+				"phase":  phaseIndicesAndConstraints,
+				"reason": "permission denied",
+				// the typed error renders its own kind ahead of the server text
+				"detail": "permission denied: ERROR:  permission denied for schema public",
+			},
+		}, logger.warnFields[0]["not_applied"])
+	})
+
+	t.Run("passes read in the order they ran", func(t *testing.T) {
+		t.Parallel()
+
+		logger := &captureLogger{Logger: log.NewNoopLogger()}
+		g := &SnapshotGenerator{logger: logger}
+
+		// the same pass reached twice keeps its first position, so the summary
+		// does not reorder itself around a retry
+		g.recordIgnored(phaseIndicesAndConstraints, []error{exists})
+		g.recordIgnored(phaseViews, []error{noEcho})
+		g.recordIgnored(phaseIndicesAndConstraints, []error{attach})
+		g.summariseIgnored()
+
+		entries, ok := logger.warnFields[0]["not_applied"].([]map[string]string)
+		require.True(t, ok)
+		require.Equal(t,
+			[]string{phaseIndicesAndConstraints, phaseIndicesAndConstraints, phaseViews},
+			[]string{entries[0]["phase"], entries[1]["phase"], entries[2]["phase"]})
+	})
+
+	t.Run("reset clears what an earlier snapshot recorded", func(t *testing.T) {
+		t.Parallel()
+
+		logger := &captureLogger{Logger: log.NewNoopLogger()}
+		g := &SnapshotGenerator{logger: logger}
+
+		g.recordIgnored(phaseSchema, []error{attach})
+		g.resetIgnored()
+		g.summariseIgnored()
+
+		require.Empty(t, logger.warnings)
+	})
+
+	t.Run("an empty slice does not open a pass", func(t *testing.T) {
+		t.Parallel()
+
+		logger := &captureLogger{Logger: log.NewNoopLogger()}
+		g := &SnapshotGenerator{logger: logger}
+
+		g.recordIgnored(phaseSchema, nil)
+		g.summariseIgnored()
+
+		require.Empty(t, logger.warnings)
+	})
+}

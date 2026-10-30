@@ -1,0 +1,192 @@
+source:
+  postgres:
+    url: "postgresql://user:password@localhost:5432/mydatabase"
+    mode: snapshot_and_replication # options are replication, snapshot or snapshot_and_replication
+    snapshot: # when mode is snapshot or snapshot_and_replication
+      mode: full # options are full, schema or data
+      tables: ["test", "test_schema.Test", "another_schema.*"] # tables to snapshot, can be a list of table names or a pattern
+      excluded_tables: ["test_schema.Test"] # tables to exclude from the snapshot
+      schema_only_tables: ["schema_only_test", "schema_only_schema.*"] # tables for which only the schema is snapshotted, no data
+      recorder:
+        repeatable_snapshots: true # whether to repeat snapshots that have already been taken
+        postgres_url: "postgresql://user:password@localhost:5432/mytargetdatabase" # URL of the database where the snapshot status is recorded
+      snapshot_workers: 4 # number of schemas to be snapshotted in parallel
+      data: # when mode is full or data
+        schema_workers: 4 # number of schema tables to be snapshotted in parallel
+        table_workers: 4 # number of workers to snapshot a table in parallel
+        batch_bytes: 83886080 # bytes to read per batch (defaults to 80MiB)
+        max_connections: 20 # maximum number of connections to use for snapshotting
+      schema: # when mode is full or schema
+        pgdump_pgrestore:
+          clean_target_db: true # whether to clean the target database before restoring
+          create_target_db: true # whether to create the database on the target postgres
+          include_global_db_objects: true # whether to include database global objects, such as extensions or triggers, on the schema snapshot
+          role: test-role # role name to be used to create the dump
+          roles_snapshot_mode: "disabled" # "enabled", "disabled" or "no_passwords" for snapshotting roles
+          dump_file: "pg_dump.sql"
+          no_owner: true # whether to remove ownership commands from the dump
+          no_privileges: true # whether to remove privileges commands from the dump (grant/revoke)
+          excluded_security_labels: ["anon"] # list of providers whose security labels will be excluded from the snapshot. Wildcard supported.
+          refresh_materialized_views: true # whether to refresh materialized views after the table data has been restored
+          index_constraint_session_settings:
+            - maintenance_work_mem=4GB
+            - max_parallel_maintenance_workers=4
+            - synchronous_commit=off
+            - statement_timeout=0
+            - lock_timeout=0
+          index_restore_workers: 4 # number of standalone indexes restored concurrently
+      disable_progress_tracking: true # whether to disable progress tracking for the snapshot
+    replication: # when mode is replication or snapshot_and_replication
+      replication_slot: "pgstream_mydatabase_slot"
+      plugin:
+        include_xids: true # whether to include transaction IDs in the replication stream events
+    retry_policy:
+      disable_retries: true # whether to disable retries for the source postgres listener
+      exponential:
+        max_retries: 5 # maximum number of retries
+        initial_interval: 1000 # initial interval in milliseconds
+        max_interval: 60000 # maximum interval in milliseconds
+  kafka:
+    servers: ["localhost:9092"]
+    topic:
+      name: "mytopic"
+    consumer_group:
+      id: "mygroup"
+      start_offset: "earliest" # options are earliest or latest
+    tls:
+      ca_cert: "/path/to/ca.crt" # path to CA certificate
+      client_cert: "/path/to/client.crt" # path to client certificate
+      client_key: "/path/to/client.key" # path to client key
+    sasl:
+      mechanism: "scram-sha-512" # options are plain, scram-sha-256 or scram-sha-512
+      user: "myuser"
+      password: "mypassword"
+    backoff:
+      disable_retries: true
+      exponential:
+        max_retries: 5 # maximum number of retries
+        initial_interval: 1000 # initial interval in milliseconds
+        max_interval: 60000 # maximum interval in milliseconds
+
+target:
+  postgres:
+    url: "postgresql://user:password@localhost:5432/mytargetdatabase"
+    max_connections: 60 # maximum number of connections in the writer pool to the target database
+    batch:
+      timeout: 1000 # batch timeout in milliseconds
+      size: 100 # number of messages in a batch
+      max_bytes: 1572864 # max size of batch in bytes (1.5MiB)
+      max_queue_bytes: 204800 # max size of memory guard queue in bytes (100MiB)
+      ignore_send_errors: true # whether to ignore errors when sending a batch
+      auto_tune:
+        enabled: true # whether to enable auto-tuning of batch size
+        min_batch_bytes: 10 # minimum batch size in bytes
+        max_batch_bytes: 1000 # maximum batch size in bytes
+        convergence_threshold: 0.05 # threshold for convergence as a fraction of batch size
+    disable_triggers: false # whether to disable triggers on the target database
+    on_conflict_action: "nothing" # options are update, nothing or error
+    bulk_ingest:
+      enabled: true # whether to use bulk ingest for the target database
+    retry_policy:
+      disable_retries: true
+      exponential:
+        max_retries: 5 # maximum number of retries
+        initial_interval: 1000 # initial interval in milliseconds
+        max_interval: 60000 # maximum interval in milliseconds
+    ignore_ddl: true # whether to ignore DDL events on the target database
+    strict_mode: true # whether to stop on non-internal query failures instead of dropping them
+  kafka:
+    servers: ["localhost:9092"]
+    topic:
+      name: "mytopic" # name of the Kafka topic
+      partitions: 1 # number of partitions for the topic
+      partition_key: "table" # message key strategy for DML events, one of schema, table or primary_key
+      replication_factor: 1 # replication factor for the topic
+      auto_create: true # whether to automatically create the topic if it doesn't exist
+    tls:
+      ca_cert: "/path/to/ca.crt" # path to CA certificate
+      client_cert: "/path/to/client.crt" # path to client certificate
+      client_key: "/path/to/client.key" # path to client key
+    sasl:
+      mechanism: "scram-sha-512" # options are plain, scram-sha-256 or scram-sha-512
+      user: "myuser"
+      password: "mypassword"
+    batch:
+      timeout: 1000 # batch timeout in milliseconds
+      size: 100 # number of messages in a batch
+      max_bytes: 1572864 # max size of batch in bytes (1.5MiB)
+      max_queue_bytes: 204800 # max size of memory guard queue in bytes (100MiB)
+      ignore_send_errors: true # whether to ignore errors when sending a batch
+  search:
+    engine: "elasticsearch" # options are elasticsearch or opensearch
+    url: "http://localhost:9200" # URL of the search engine
+    batch:
+      timeout: 1000 # batch timeout in milliseconds
+      size: 100 # number of messages in a batch
+      max_bytes: 1572864 # max size of batch in bytes (1.5MiB)
+      max_queue_bytes: 204800 # max size of memory guard queue in bytes (100MiB)
+      ignore_send_errors: true # whether to ignore errors when sending a batch
+    backoff:
+      disable_retries: true
+      exponential:
+        max_retries: 5 # maximum number of retries
+        initial_interval: 1000 # initial interval in milliseconds
+        max_interval: 60000 # maximum interval in milliseconds
+  webhooks:
+    subscriptions:
+      store:
+        url: "postgresql://user:password@localhost:5432/mydatabase" # URL of the database where the webhook subscriptions are stored
+        cache:
+          enabled: true # whether to enable caching for the subscription store
+          refresh_interval: 60 # interval in seconds to refresh the cache
+      server:
+        address: "localhost:9090" # address of the subscription server
+        read_timeout: 60 # read timeout in seconds
+        write_timeout: 60 # write timeout in seconds
+    notifier:
+      worker_count: 4 # number of notifications to be processed in parallel
+      client_timeout: 1000 # timeout for the webhook client in milliseconds
+
+
+modifiers:
+  injector:
+    enabled: true # whether to inject pgstream metadata into the WAL events
+  filter: # one of include_tables or exclude_tables
+    include_tables: # list of tables for which events should be allowed. Tables should be schema qualified. If no schema is provided, the public schema will be assumed. Wildcards "*" are supported.
+     - "test"
+     - "test_schema.test"
+     - "another_schema.*"
+    exclude_tables: # list of tables for which events should be skipped. Tables should be schema qualified. If no schema is provided, the public schema will be assumed. Wildcards "*" are supported.
+     - "excluded_test"
+     - "excluded_schema.test"
+     - "another_excluded_schema.*"
+    schema_only_tables: # list of tables for which DDL events are allowed but data events are skipped. Tables should be schema qualified. If no schema is provided, the public schema will be assumed. Wildcards "*" are supported.
+     - "schema_only_test"
+     - "schema_only_schema.*"
+  transformations:
+    infer_from_security_labels: false
+    dump_inferred_rules: false
+    validation_mode: relaxed
+    table_transformers:
+      - schema: public
+        table: test
+        column_transformers:
+          name:
+            name: greenmask_firstname
+            dynamic_parameters:
+              gender:
+                column: sex
+
+logging:
+  level: info # log level for the application. One of trace, debug, info, warn, error, fatal, panic.
+  format:
+    type: console # log output format. One of console or json.
+    no_color: true # disable ANSI color codes in console log output. Only valid when type is console.
+
+instrumentation:
+  metrics:
+    endpoint: "http://localhost:4317"
+    collection_interval: 60 # collection interval for metrics in seconds. Defaults to 60s
+  traces:
+    endpoint: "http://localhost:4317"
+    sample_ratio: 0.5 # ratio of traces that will be sampled. Must be between 0.0-1.0, where 0 is no traces sampled, and 1 all traces sampled.

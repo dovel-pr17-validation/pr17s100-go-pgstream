@@ -1,0 +1,271 @@
+// SPDX-License-Identifier: Apache-2.0
+
+package postgres
+
+import (
+	"errors"
+	"fmt"
+	"regexp"
+	"strings"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
+)
+
+var (
+	ErrConnTimeout = errors.New("connection timeout")
+	ErrNoRows      = errors.New("no rows")
+)
+
+type ErrRelationDoesNotExist struct {
+	Details string
+}
+
+func (e *ErrRelationDoesNotExist) Error() string {
+	return fmt.Sprintf("relation does not exist: %s", e.Details)
+}
+
+type ErrConstraintViolation struct {
+	Details string
+}
+
+func (e *ErrConstraintViolation) Error() string {
+	return fmt.Sprintf("constraint violation: %s", e.Details)
+}
+
+type ErrCommentOwnership struct {
+	Details string
+}
+
+func (e *ErrCommentOwnership) Error() string {
+	return fmt.Sprintf("comment not restored, requires object ownership: %s", e.Details)
+}
+
+type ErrPermissionDenied struct {
+	Details string
+}
+
+func (e *ErrPermissionDenied) Error() string {
+	return fmt.Sprintf("permission denied: %s", e.Details)
+}
+
+type ErrSyntaxError struct {
+	Details string
+}
+
+func (e *ErrSyntaxError) Error() string {
+	return fmt.Sprintf("syntax error: %s", e.Details)
+}
+
+type ErrDataException struct {
+	Details string
+}
+
+func (e *ErrDataException) Error() string {
+	return fmt.Sprintf("data exception: %s", e.Details)
+}
+
+// ErrTransientFailure reports a failure that is not caused by the statement
+// being restored, such as a dropped connection or a lock that could not be
+// acquired in time. The same statement can succeed if it is run again.
+type ErrTransientFailure struct {
+	Details string
+}
+
+func (e *ErrTransientFailure) Error() string {
+	return fmt.Sprintf("transient failure: %s", e.Details)
+}
+
+type ErrRelationAlreadyExists struct {
+	Details string
+}
+
+func (e *ErrRelationAlreadyExists) Error() string {
+	return fmt.Sprintf("relation already exists: %v", e.Details)
+}
+
+type ErrRuleViolation struct {
+	Details string
+}
+
+func (e *ErrRuleViolation) Error() string {
+	return fmt.Sprintf("rule violation: %s", e.Details)
+}
+
+type ErrPreconditionFailed struct {
+	Details string
+}
+
+func (e *ErrPreconditionFailed) Error() string {
+	return fmt.Sprintf("precondition failed: %s", e.Details)
+}
+
+type ErrCacheLookupFailed struct {
+	Details string
+}
+
+func (e *ErrCacheLookupFailed) Error() string {
+	return fmt.Sprintf("cache lookup failed: %s", e.Details)
+}
+
+type ErrProgramLimitExceeded struct {
+	Details string
+}
+
+func (e *ErrProgramLimitExceeded) Error() string {
+	return fmt.Sprintf("program limit exceeded: %s", e.Details)
+}
+
+type ErrFeatureNotSupported struct {
+	Details string
+}
+
+func (e *ErrFeatureNotSupported) Error() string {
+	return fmt.Sprintf("feature not supported: %s", e.Details)
+}
+
+type ErrActiveSQLTransaction struct {
+	Details string
+}
+
+func (e *ErrActiveSQLTransaction) Error() string {
+	return fmt.Sprintf("active sql transaction: %s", e.Details)
+}
+
+type ErrValueEncoding struct {
+	Details string
+}
+
+func (e *ErrValueEncoding) Error() string {
+	return fmt.Sprintf("value encoding: %s", e.Details)
+}
+
+const encodeArgsErrFragment = "failed to encode args["
+
+var encodeArgsErrDetails = regexp.MustCompile(`^(.*?failed to encode args\[\d+\]).*?(for [^:]+)`)
+
+// MapError maps a Postgres error to a more specific error type
+func MapError(err error) error {
+	if pgconn.Timeout(err) {
+		return fmt.Errorf("%w: %w", ErrConnTimeout, err)
+	}
+
+	if errors.Is(err, pgx.ErrNoRows) {
+		return ErrNoRows
+	}
+
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) {
+		switch pgErr.Code {
+		case "42703", "42883", "42P01", "42P02", "42704":
+			// 42703 	undefined_column
+			// 42883 	undefined_function
+			// 42P01 	undefined_table
+			// 42P02 	undefined_parameter
+			// 42704 	undefined_object
+			return &ErrRelationDoesNotExist{
+				Details: pgErr.Message,
+			}
+		case "42601", "42000":
+			// 42000 	syntax_error_or_access_rule_violation
+			// 42601 	syntax_error
+			return &ErrSyntaxError{
+				Details: pgErr.Message,
+			}
+		case "428C9", "42939", "42809":
+			// 428C9 	generated_always
+			// 42939 	reserved_name
+			// 42809 	wrong_object_type
+			return &ErrRuleViolation{
+				Details: pgErr.Message,
+			}
+		case "42501":
+			// 42501 	insufficient_privilege
+			return &ErrPermissionDenied{
+				Details: pgErr.Message,
+			}
+		case "55000":
+			// 55000 	object_not_in_prerequisite_state
+			return &ErrPreconditionFailed{
+				Details: pgErr.Message,
+			}
+		case "XX000":
+			// XX000 	internal_error
+			// Only map cache lookup failures to a specific error type for retry logic
+			if strings.Contains(pgErr.Message, "cache lookup failed") {
+				return &ErrCacheLookupFailed{
+					Details: pgErr.Message,
+				}
+			}
+		case "25001":
+			// 25001 	active_sql_transaction
+			return &ErrActiveSQLTransaction{
+				Details: pgErr.Message,
+			}
+		case "0A000":
+			// 0A000 	feature_not_supported
+			return &ErrFeatureNotSupported{
+				Details: pgErr.Message,
+			}
+		case "42701", "42P03", "42P04", "42723", "42P05", "42P06", "42P07", "42712", "42710":
+			// 42701 	duplicate_column
+			// 42P03 	duplicate_cursor
+			// 42P04 	duplicate_database
+			// 42723 	duplicate_function
+			// 42P05 	duplicate_prepared_statement
+			// 42P06 	duplicate_schema
+			// 42P07 	duplicate_table
+			// 42712 	duplicate_alias
+			// 42710 	duplicate_object
+			return &ErrRelationAlreadyExists{
+				Details: pgErr.Message,
+			}
+		}
+
+		// Class 22 — Data Exception
+		if strings.HasPrefix(pgErr.Code, "22") {
+			return &ErrDataException{
+				Details: withErrorContext(pgErr),
+			}
+		}
+		// Class 23 — Integrity Constraint Violation
+		if strings.HasPrefix(pgErr.Code, "23") {
+			return &ErrConstraintViolation{
+				Details: pgErr.Message,
+			}
+		}
+
+		// Class 54 — Program Limit Exceeded
+		if strings.HasPrefix(pgErr.Code, "54") {
+			return &ErrProgramLimitExceeded{
+				Details: pgErr.Message,
+			}
+		}
+	}
+
+	// A client-side encoding failure is recognized last, and only when nothing
+	// carried a SQLSTATE: it never reaches the server, so it can never be a
+	// PgError. Checking it earlier would let a genuine server error whose
+	// message happens to quote the fragment — postgres embeds row values in
+	// messages, and pgstream is often pointed at tables holding log text — be
+	// misclassified, changing how the writer and the retrier handle it.
+	if err != nil && pgErr == nil && strings.Contains(err.Error(), encodeArgsErrFragment) {
+		return &ErrValueEncoding{Details: encodingErrDetails(err.Error())}
+	}
+
+	return err
+}
+
+func withErrorContext(pgErr *pgconn.PgError) string {
+	if pgErr.Where == "" {
+		return pgErr.Message
+	}
+	return fmt.Sprintf("%s (%s)", pgErr.Message, pgErr.Where)
+}
+
+func encodingErrDetails(msg string) string {
+	if m := encodeArgsErrDetails.FindStringSubmatch(msg); m != nil {
+		return m[1] + " " + m[2]
+	}
+	return encodeArgsErrFragment
+}

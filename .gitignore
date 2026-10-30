@@ -1,0 +1,12 @@
+bin/license-header-checker
+pgstream
+tools/webhook/webhook
+
+*.prof
+
+coverage
+
+# misc
+.DS_Store
+
+.idea/

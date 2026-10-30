@@ -1,0 +1,590 @@
+// SPDX-License-Identifier: Apache-2.0
+
+package postgres
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/require"
+	pglib "github.com/xataio/pgstream/internal/postgres"
+	pgmocks "github.com/xataio/pgstream/internal/postgres/mocks"
+	synclib "github.com/xataio/pgstream/internal/sync"
+	"github.com/xataio/pgstream/pkg/backoff"
+	loglib "github.com/xataio/pgstream/pkg/log"
+	"github.com/xataio/pgstream/pkg/wal"
+	"github.com/xataio/pgstream/pkg/wal/processor"
+	"github.com/xataio/pgstream/pkg/wal/processor/batch"
+	batchmocks "github.com/xataio/pgstream/pkg/wal/processor/batch/mocks"
+	"golang.org/x/sync/errgroup"
+)
+
+func TestBulkIngestWriter_ProcessWALEvent(t *testing.T) {
+	t.Parallel()
+
+	testSchema1 := "test_schema_1"
+	testTable1 := "test_table_1"
+	testSchema2 := "test_schema_2"
+	testTable2 := "test_table_2"
+
+	testTable1Key := pglib.QuoteQualifiedIdentifier(testSchema1, testTable1)
+	testTable2Key := pglib.QuoteQualifiedIdentifier(testSchema2, testTable2)
+
+	testWalEvent := func(schema, table string) *wal.Event {
+		return &wal.Event{
+			Data: &wal.Data{
+				Action: "I",
+				LSN:    testLSNStr,
+				Schema: schema,
+				Table:  table,
+			},
+			CommitPosition: testCommitPosition,
+		}
+	}
+
+	testInsertQuery := func(schema, table string) *query {
+		return &query{
+			schema:      schema,
+			table:       table,
+			columnNames: []string{"id", "name"},
+			sql:         "INSERT INTO test(id, name) VALUES($1, $2) ON CONFLICT (id) DO NOTHING",
+			args:        []any{1, "alice"},
+		}
+	}
+
+	testAdapter := &mockAdapter{
+		walEventToQueriesFn: func(e *wal.Event) ([]*query, error) {
+			switch e.Data.Schema {
+			case testSchema1:
+				require.Equal(t, e, testWalEvent(testSchema1, testTable1))
+				return []*query{testInsertQuery(testSchema1, testTable1)}, nil
+			case testSchema2:
+				require.Equal(t, e, testWalEvent(testSchema2, testTable2))
+				return []*query{testInsertQuery(testSchema2, testTable2)}, nil
+			default:
+				return nil, fmt.Errorf("unexpected event received: %v", e)
+			}
+		},
+	}
+
+	tests := []struct {
+		name               string
+		walEvents          []*wal.Event
+		batchSenderMap     map[string]queryBatchSender
+		adapter            walAdapter
+		batchSenderBuilder func(ctx context.Context, schema, table string) (queryBatchSender, error)
+
+		wantMsgs map[string][]*batch.WALMessage[*query]
+		wantErr  error
+	}{
+		{
+			name: "ok - multiple events for different tables",
+			walEvents: []*wal.Event{
+				testWalEvent(testSchema1, testTable1),
+				testWalEvent(testSchema2, testTable2),
+			},
+			batchSenderMap: map[string]queryBatchSender{
+				testTable1Key: batchmocks.NewBatchSender[*query](),
+				testTable2Key: batchmocks.NewBatchSender[*query](),
+			},
+			adapter: testAdapter,
+			batchSenderBuilder: func(ctx context.Context, schema, table string) (queryBatchSender, error) {
+				return nil, errors.New("batchSenderBuilder should not be called")
+			},
+
+			wantMsgs: map[string][]*batch.WALMessage[*query]{
+				testTable1Key: {batch.NewWALMessage(testInsertQuery(testSchema1, testTable1), testCommitPosition)},
+				testTable2Key: {batch.NewWALMessage(testInsertQuery(testSchema2, testTable2), testCommitPosition)},
+			},
+			wantErr: nil,
+		},
+		{
+			name: "ok - non insert events skipped",
+			walEvents: []*wal.Event{
+				{
+					Data: &wal.Data{
+						Action: "U",
+						LSN:    testLSNStr,
+						Schema: testSchema1,
+						Table:  testTable1,
+					},
+					CommitPosition: testCommitPosition,
+				},
+			},
+			batchSenderMap: nil,
+			adapter:        testAdapter,
+			batchSenderBuilder: func(ctx context.Context, schema, table string) (queryBatchSender, error) {
+				return nil, errors.New("batchSenderBuilder should not be called")
+			},
+
+			wantMsgs: nil,
+			wantErr:  nil,
+		},
+		{
+			name:           "error - event to query",
+			walEvents:      []*wal.Event{testWalEvent(testSchema1, testTable1)},
+			batchSenderMap: nil,
+			adapter: &mockAdapter{
+				walEventToQueriesFn: func(e *wal.Event) ([]*query, error) {
+					return nil, errTest
+				},
+			},
+			batchSenderBuilder: func(ctx context.Context, schema, table string) (queryBatchSender, error) {
+				return nil, errors.New("batchSenderBuilder should not be called")
+			},
+
+			wantMsgs: nil,
+			wantErr:  errTest,
+		},
+		{
+			name:           "error - creating batch sender",
+			walEvents:      []*wal.Event{testWalEvent(testSchema1, testTable1)},
+			batchSenderMap: nil,
+			adapter:        testAdapter,
+			batchSenderBuilder: func(ctx context.Context, schema, table string) (queryBatchSender, error) {
+				return nil, errTest
+			},
+
+			wantMsgs: nil,
+			wantErr:  errTest,
+		},
+		{
+			name:           "error - sending message",
+			walEvents:      []*wal.Event{testWalEvent(testSchema1, testTable1)},
+			batchSenderMap: make(map[string]queryBatchSender),
+			adapter:        testAdapter,
+			batchSenderBuilder: func(ctx context.Context, schema, table string) (queryBatchSender, error) {
+				s := batchmocks.NewBatchSender[*query]()
+				s.SendMessageFn = func(ctx context.Context, w *batch.WALMessage[*query]) error {
+					return errTest
+				}
+				return s, nil
+			},
+
+			wantMsgs: nil,
+			wantErr:  errTest,
+		},
+		{
+			name:           "error - panic recovery",
+			walEvents:      []*wal.Event{testWalEvent(testSchema1, testTable1)},
+			batchSenderMap: nil,
+			adapter: &mockAdapter{
+				walEventToQueriesFn: func(e *wal.Event) ([]*query, error) {
+					panic(errTest)
+				},
+			},
+
+			wantMsgs: nil,
+			wantErr:  processor.ErrPanic,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			writer := &BulkIngestWriter{
+				Writer: &Writer{
+					logger:  loglib.NewNoopLogger(),
+					adapter: tc.adapter,
+				},
+				batchSenderMap:     synclib.NewMapFromMap(tc.batchSenderMap),
+				batchSenderBuilder: tc.batchSenderBuilder,
+			}
+
+			// Snapshot the senders the test case seeded. The writer builds
+			// further senders into the same map while processing, so reading
+			// it back once processing has started is both racy and
+			// non-deterministic.
+			senders := make(map[string]*batchmocks.BatchSender[*query], len(tc.batchSenderMap))
+			for key, sender := range tc.batchSenderMap {
+				mockSender, ok := sender.(*batchmocks.BatchSender[*query])
+				require.True(t, ok)
+				senders[key] = mockSender
+			}
+
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+
+			go func() {
+				defer func() {
+					for _, sender := range writer.batchSenderMap.GetMap() {
+						sender.Close()
+					}
+				}()
+				for _, evt := range tc.walEvents {
+					err := writer.ProcessWALEvent(ctx, evt)
+					require.ErrorIs(t, err, tc.wantErr)
+				}
+			}()
+
+			eg := errgroup.Group{}
+			for key, sender := range senders {
+				eg.Go(func() error {
+					require.Equal(t, tc.wantMsgs[key], sender.GetWALMessages())
+					return nil
+				})
+			}
+			require.NoError(t, eg.Wait())
+		})
+	}
+}
+
+func TestBulkIngestWriter_sendBatch(t *testing.T) {
+	t.Parallel()
+
+	testSchema := "test_table"
+	testTable := "test_schema"
+
+	testQuery := &query{
+		schema:      testSchema,
+		table:       testTable,
+		columnNames: []string{`"id"`, `"name"`},
+		sql:         "INSERT INTO users(id, name) VALUES($1, $2)",
+		args:        []any{1, "alice"},
+	}
+
+	tests := []struct {
+		name            string
+		batch           *batch.Batch[*query]
+		pgConn          *pgmocks.Querier
+		disableTriggers bool
+
+		wantErr error
+	}{
+		{
+			name:  "ok - empty batch",
+			batch: batch.NewBatch([]*query{}, nil),
+			pgConn: &pgmocks.Querier{
+				ExecInTxFn: func(ctx context.Context, f func(tx pglib.Tx) error) error {
+					tx := &pgmocks.Tx{
+						CopyFromFn: func(ctx context.Context, tableName string, columnNames []string, rows [][]any) (int64, error) {
+							return -1, errors.New("unexpected call to CopyFrom with empty batch")
+						},
+					}
+					return f(tx)
+				},
+				QueryFn: func(ctx context.Context, _ uint, query string, args ...any) (pglib.Rows, error) {
+					return nil, errors.New("unexpected call to QueryFn with empty batch")
+				},
+			},
+
+			wantErr: nil,
+		},
+		{
+			name:  "ok",
+			batch: batch.NewBatch([]*query{testQuery}, nil),
+			pgConn: &pgmocks.Querier{
+				ExecInTxFn: func(ctx context.Context, f func(tx pglib.Tx) error) error {
+					tx := &pgmocks.Tx{
+						CopyFromFn: func(ctx context.Context, tableName string, columnNames []string, rows [][]any) (int64, error) {
+							require.Equal(t, pglib.QuoteQualifiedIdentifier(testSchema, testTable), tableName)
+							require.Equal(t, testQuery.columnNames, columnNames)
+							require.Equal(t, testQuery.args, rows[0])
+							return 1, nil
+						},
+					}
+					return f(tx)
+				},
+			},
+
+			wantErr: nil,
+		},
+		{
+			name:  "ok - disable triggers",
+			batch: batch.NewBatch([]*query{testQuery}, nil),
+			pgConn: &pgmocks.Querier{
+				ExecInTxFn: func(ctx context.Context, f func(tx pglib.Tx) error) error {
+					tx := &pgmocks.Tx{
+						ExecFn: func(ctx context.Context, i uint, s string, a ...any) (pglib.CommandTag, error) {
+							switch i {
+							case 1:
+								require.Equal(t, "SET session_replication_role = replica", s)
+							case 2:
+								require.Equal(t, "SET session_replication_role = DEFAULT", s)
+							default:
+								return pglib.CommandTag{}, fmt.Errorf("unexpected number of calls to tx ExecFn: %d", i)
+							}
+							return pglib.CommandTag{}, nil
+						},
+						CopyFromFn: func(ctx context.Context, tableName string, columnNames []string, rows [][]any) (int64, error) {
+							require.Equal(t, pglib.QuoteQualifiedIdentifier(testSchema, testTable), tableName)
+							require.Equal(t, testQuery.columnNames, columnNames)
+							require.Equal(t, testQuery.args, rows[0])
+							return 1, nil
+						},
+					}
+					return f(tx)
+				},
+			},
+			disableTriggers: true,
+
+			wantErr: nil,
+		},
+		{
+			name:  "error - copying from",
+			batch: batch.NewBatch([]*query{testQuery}, nil),
+			pgConn: &pgmocks.Querier{
+				ExecInTxFn: func(ctx context.Context, f func(tx pglib.Tx) error) error {
+					tx := &pgmocks.Tx{
+						CopyFromFn: func(ctx context.Context, tableName string, columnNames []string, rows [][]any) (int64, error) {
+							return 0, errTest
+						},
+					}
+					return f(tx)
+				},
+			},
+
+			wantErr: errTest,
+		},
+		{
+			name:  "error - rows copied mismatch",
+			batch: batch.NewBatch([]*query{testQuery}, nil),
+			pgConn: &pgmocks.Querier{
+				ExecInTxFn: func(ctx context.Context, f func(tx pglib.Tx) error) error {
+					tx := &pgmocks.Tx{
+						CopyFromFn: func(ctx context.Context, tableName string, columnNames []string, rows [][]any) (int64, error) {
+							return 0, nil
+						},
+					}
+					return f(tx)
+				},
+			},
+
+			wantErr: errUnexpectedCopiedRows,
+		},
+		{
+			name:  "error - setting replication role to replica",
+			batch: batch.NewBatch([]*query{testQuery}, nil),
+			pgConn: &pgmocks.Querier{
+				ExecInTxFn: func(ctx context.Context, f func(tx pglib.Tx) error) error {
+					tx := &pgmocks.Tx{
+						ExecFn: func(ctx context.Context, i uint, s string, a ...any) (pglib.CommandTag, error) {
+							switch i {
+							case 1:
+								require.Equal(t, "SET session_replication_role = replica", s)
+								return pglib.CommandTag{}, errTest
+							default:
+								return pglib.CommandTag{}, fmt.Errorf("unexpected number of calls to tx ExecFn: %d", i)
+							}
+						},
+						CopyFromFn: func(ctx context.Context, tableName string, columnNames []string, rows [][]any) (int64, error) {
+							return 0, errors.New("CopyFrom should not be called")
+						},
+					}
+					return f(tx)
+				},
+			},
+			disableTriggers: true,
+
+			wantErr: errTest,
+		},
+		{
+			name:  "error - resetting replication role",
+			batch: batch.NewBatch([]*query{testQuery}, nil),
+			pgConn: &pgmocks.Querier{
+				ExecInTxFn: func(ctx context.Context, f func(tx pglib.Tx) error) error {
+					tx := &pgmocks.Tx{
+						ExecFn: func(ctx context.Context, i uint, s string, a ...any) (pglib.CommandTag, error) {
+							switch i {
+							case 1:
+								require.Equal(t, "SET session_replication_role = replica", s)
+								return pglib.CommandTag{}, nil
+							case 2:
+								require.Equal(t, "SET session_replication_role = DEFAULT", s)
+								return pglib.CommandTag{}, errTest
+							default:
+								return pglib.CommandTag{}, fmt.Errorf("unexpected number of calls to tx ExecFn: %d", i)
+							}
+						},
+						CopyFromFn: func(ctx context.Context, tableName string, columnNames []string, rows [][]any) (int64, error) {
+							return 1, nil
+						},
+					}
+					return f(tx)
+				},
+			},
+			disableTriggers: true,
+
+			wantErr: errTest,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			writer := &BulkIngestWriter{
+				Writer: &Writer{
+					logger:          loglib.NewNoopLogger(),
+					pgConn:          tc.pgConn,
+					disableTriggers: tc.disableTriggers,
+				},
+				copyBudget: synclib.NewWeightedSemaphore(pglib.MaxConns - synclib.CopyBudgetReserve),
+			}
+
+			err := writer.sendBatch(context.Background(), tc.batch)
+			if !errors.Is(err, tc.wantErr) {
+				require.Equal(t, tc.wantErr, err)
+			}
+		})
+	}
+}
+
+// TestBulkIngestWriter_sendBatch_copyBudget verifies that the global
+// concurrent-COPY budget caps the number of COPYs in flight at once across all
+// concurrent sendBatch calls, regardless of how many callers there are.
+func TestBulkIngestWriter_sendBatch_copyBudget(t *testing.T) {
+	t.Parallel()
+
+	const budget = 2
+	const callers = 8
+
+	testQuery := &query{
+		schema:      "test_schema",
+		table:       "test_table",
+		columnNames: []string{`"id"`},
+		args:        []any{1},
+	}
+
+	var active, maxActive atomic.Int32
+	release := make(chan struct{})
+	pgConn := &pgmocks.Querier{
+		ExecInTxFn: func(ctx context.Context, f func(tx pglib.Tx) error) error {
+			n := active.Add(1)
+			for {
+				m := maxActive.Load()
+				if n <= m || maxActive.CompareAndSwap(m, n) {
+					break
+				}
+			}
+			<-release
+			active.Add(-1)
+			tx := &pgmocks.Tx{
+				CopyFromFn: func(context.Context, string, []string, [][]any) (int64, error) {
+					return 1, nil
+				},
+			}
+			return f(tx)
+		},
+	}
+
+	writer := &BulkIngestWriter{
+		Writer: &Writer{
+			logger: loglib.NewNoopLogger(),
+			pgConn: pgConn,
+		},
+		copyBudget: synclib.NewWeightedSemaphore(budget),
+	}
+
+	eg := errgroup.Group{}
+	for i := 0; i < callers; i++ {
+		eg.Go(func() error {
+			return writer.sendBatch(context.Background(), batch.NewBatch([]*query{testQuery}, nil))
+		})
+	}
+
+	// give the callers time to contend for the budget, then let them drain.
+	require.Eventually(t, func() bool {
+		return maxActive.Load() == budget
+	}, 5*time.Second, time.Millisecond)
+	close(release)
+
+	require.NoError(t, eg.Wait())
+	require.Equal(t, int32(budget), maxActive.Load(), "concurrent COPYs must not exceed the budget")
+}
+
+func TestCopyBudgetSize(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name           string
+		maxConnections int32
+		expected       int64
+	}{
+		{name: "default pool", maxConnections: pglib.MaxConns, expected: 45},
+		{name: "configured pool", maxConnections: 12, expected: 7},
+		{name: "reserve matches pool", maxConnections: synclib.CopyBudgetReserve, expected: 1},
+		{name: "pool smaller than reserve", maxConnections: 2, expected: 1},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			require.Equal(t, tt.expected, synclib.CopyBudgetSize(tt.maxConnections))
+		})
+	}
+}
+
+func TestNewBulkIngestWriter_maxConnections(t *testing.T) {
+	tests := []struct {
+		name             string
+		url              string
+		maxConnections   uint
+		expected         int32
+		expectedObserver int32
+	}{
+		{
+			name:             "connection URL",
+			url:              "postgresql://user:password@localhost:5432/database?pool_max_conns=12",
+			expected:         12,
+			expectedObserver: 12,
+		},
+		{
+			name:             "writer config overrides connection URL",
+			url:              "postgresql://user:password@localhost:5432/database?pool_max_conns=12",
+			maxConnections:   20,
+			expected:         20,
+			expectedObserver: maxObserverConnections,
+		},
+		{
+			name:             "observer capped below the writer pool",
+			url:              "postgresql://user:password@localhost:5432/database",
+			maxConnections:   200,
+			expected:         200,
+			expectedObserver: maxObserverConnections,
+		},
+		{
+			name:             "observer never exceeds the writer pool",
+			url:              "postgresql://user:password@localhost:5432/database",
+			maxConnections:   2,
+			expected:         2,
+			expectedObserver: 2,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			writer, err := NewBulkIngestWriter(t.Context(), &Config{
+				URL:            tt.url,
+				MaxConnections: tt.maxConnections,
+				RetryPolicy:    backoff.Config{DisableRetries: true},
+			})
+			require.NoError(t, err)
+			t.Cleanup(func() { require.NoError(t, writer.Close()) })
+
+			writerPool, ok := writer.pgConn.(*pglib.Pool)
+			require.True(t, ok)
+			require.Equal(t, tt.expected, writerPool.Config().MaxConns)
+
+			adapter, ok := writer.adapter.(*adapter)
+			require.True(t, ok)
+			observer, ok := adapter.schemaObserver.(*pgSchemaObserver)
+			require.True(t, ok)
+			observerPool, ok := observer.pgConn.(*pglib.Pool)
+			require.True(t, ok)
+			require.Equal(t, tt.expectedObserver, observerPool.Config().MaxConns)
+
+			budget := synclib.CopyBudgetSize(tt.expected)
+			for range budget {
+				require.True(t, writer.copyBudget.TryAcquire(1))
+			}
+			require.False(t, writer.copyBudget.TryAcquire(1))
+			writer.copyBudget.Release(budget)
+		})
+	}
+}

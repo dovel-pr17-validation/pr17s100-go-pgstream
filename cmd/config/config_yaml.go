@@ -1,0 +1,1081 @@
+// SPDX-License-Identifier: Apache-2.0
+
+package config
+
+import (
+	"errors"
+	"fmt"
+	"time"
+
+	"github.com/xataio/pgstream/internal/health"
+	"github.com/xataio/pgstream/pkg/backoff"
+	"github.com/xataio/pgstream/pkg/kafka"
+	"github.com/xataio/pgstream/pkg/otel"
+	pgsnapshotgenerator "github.com/xataio/pgstream/pkg/snapshot/generator/postgres/data"
+	"github.com/xataio/pgstream/pkg/snapshot/generator/postgres/schema/pgdumprestore"
+	"github.com/xataio/pgstream/pkg/stream"
+	"github.com/xataio/pgstream/pkg/tls"
+	kafkacheckpoint "github.com/xataio/pgstream/pkg/wal/checkpointer/kafka"
+	"github.com/xataio/pgstream/pkg/wal/listener/snapshot/adapter"
+	snapshotbuilder "github.com/xataio/pgstream/pkg/wal/listener/snapshot/builder"
+	"github.com/xataio/pgstream/pkg/wal/processor/batch"
+	"github.com/xataio/pgstream/pkg/wal/processor/filter"
+	"github.com/xataio/pgstream/pkg/wal/processor/injector"
+	kafkaprocessor "github.com/xataio/pgstream/pkg/wal/processor/kafka"
+	"github.com/xataio/pgstream/pkg/wal/processor/postgres"
+	"github.com/xataio/pgstream/pkg/wal/processor/search"
+	"github.com/xataio/pgstream/pkg/wal/processor/search/store"
+	"github.com/xataio/pgstream/pkg/wal/processor/transformer"
+	"github.com/xataio/pgstream/pkg/wal/processor/webhook/notifier"
+	"github.com/xataio/pgstream/pkg/wal/processor/webhook/subscription/server"
+	pgreplication "github.com/xataio/pgstream/pkg/wal/replication/postgres"
+)
+
+type InstrumentationConfig struct {
+	Metrics *MetricsConfig `mapstructure:"metrics" yaml:"metrics"`
+	Traces  *TracesConfig  `mapstructure:"traces" yaml:"traces"`
+	Health  *HealthConfig  `mapstructure:"health" yaml:"health"`
+}
+
+type HealthConfig struct {
+	Enabled bool   `mapstructure:"enabled" yaml:"enabled"`
+	Address string `mapstructure:"address" yaml:"address"`
+}
+
+type MetricsConfig struct {
+	Prometheus         *PrometheusConfig `mapstructure:"prometheus" yaml:"prometheus"`
+	Endpoint           string            `mapstructure:"endpoint" yaml:"endpoint"`
+	CollectionInterval int               `mapstructure:"collection_interval" yaml:"collection_interval"`
+}
+
+type PrometheusConfig struct {
+	Enabled  bool   `mapstructure:"enabled" yaml:"enabled"`
+	Endpoint string `mapstructure:"endpoint" yaml:"endpoint"`
+}
+
+type TracesConfig struct {
+	Endpoint    string  `mapstructure:"endpoint" yaml:"endpoint"`
+	SampleRatio float64 `mapstructure:"sample_ratio" yaml:"sample_ratio"`
+}
+
+type YAMLConfig struct {
+	Source    SourceConfig    `mapstructure:"source" yaml:"source"`
+	Target    TargetConfig    `mapstructure:"target" yaml:"target"`
+	Modifiers ModifiersConfig `mapstructure:"modifiers" yaml:"modifiers"`
+	Logging   *LoggingConfig  `mapstructure:"logging" yaml:"logging"`
+}
+
+type LoggingConfig struct {
+	Level  string              `mapstructure:"level" yaml:"level"`
+	Format LoggingFormatConfig `mapstructure:"format" yaml:"format"`
+}
+
+type LoggingFormatConfig struct {
+	Type    string `mapstructure:"type" yaml:"type"`
+	NoColor bool   `mapstructure:"no_color" yaml:"no_color"`
+}
+
+type SourceConfig struct {
+	Postgres *PostgresConfig `mapstructure:"postgres" yaml:"postgres"`
+	Kafka    *KafkaConfig    `mapstructure:"kafka" yaml:"kafka"`
+}
+
+type TargetConfig struct {
+	Postgres *PostgresTargetConfig `mapstructure:"postgres" yaml:"postgres"`
+	Kafka    *KafkaTargetConfig    `mapstructure:"kafka" yaml:"kafka"`
+	Search   *SearchConfig         `mapstructure:"search" yaml:"search"`
+	Webhooks *WebhooksConfig       `mapstructure:"webhooks" yaml:"webhooks"`
+	Stdout   *StdoutTargetConfig   `mapstructure:"stdout" yaml:"stdout"`
+}
+
+type StdoutTargetConfig struct{}
+
+type PostgresConfig struct {
+	URL         string             `mapstructure:"url" yaml:"url"`
+	Mode        string             `mapstructure:"mode" yaml:"mode"`
+	Snapshot    *SnapshotConfig    `mapstructure:"snapshot" yaml:"snapshot"`
+	Replication *ReplicationConfig `mapstructure:"replication" yaml:"replication"`
+	RetryPolicy BackoffConfig      `mapstructure:"retry_policy" yaml:"retry_policy"`
+}
+
+type SnapshotConfig struct {
+	Mode                    string                  `mapstructure:"mode" yaml:"mode"`
+	Tables                  []string                `mapstructure:"tables" yaml:"tables"`
+	ExcludedTables          []string                `mapstructure:"excluded_tables" yaml:"excluded_tables"`
+	SchemaOnlyTables        []string                `mapstructure:"schema_only_tables" yaml:"schema_only_tables"`
+	Recorder                *SnapshotRecorderConfig `mapstructure:"recorder" yaml:"recorder"`
+	SnapshotWorkers         int                     `mapstructure:"snapshot_workers" yaml:"snapshot_workers"`
+	Data                    *SnapshotDataConfig     `mapstructure:"data" yaml:"data"`
+	Schema                  *SnapshotSchemaConfig   `mapstructure:"schema" yaml:"schema"`
+	DisableProgressTracking bool                    `mapstructure:"disable_progress_tracking" yaml:"disable_progress_tracking"`
+}
+
+type SnapshotRecorderConfig struct {
+	RepeatableSnapshots bool   `mapstructure:"repeatable_snapshots" yaml:"repeatable_snapshots"`
+	PostgresURL         string `mapstructure:"postgres_url" yaml:"postgres_url"`
+}
+
+type SnapshotDataConfig struct {
+	SchemaWorkers  int      `mapstructure:"schema_workers" yaml:"schema_workers"`
+	TableWorkers   int      `mapstructure:"table_workers" yaml:"table_workers"`
+	BatchBytes     byteSize `mapstructure:"batch_bytes" yaml:"batch_bytes"`
+	MaxConnections uint     `mapstructure:"max_connections" yaml:"max_connections"`
+}
+
+type SnapshotSchemaConfig struct {
+	PgDumpPgRestore *PgDumpPgRestoreConfig `mapstructure:"pgdump_pgrestore" yaml:"pgdump_pgrestore"`
+}
+
+type PgDumpPgRestoreConfig struct {
+	CleanTargetDB                  bool     `mapstructure:"clean_target_db" yaml:"clean_target_db"`
+	CreateTargetDB                 bool     `mapstructure:"create_target_db" yaml:"create_target_db"`
+	IncludeGlobalDBObjects         bool     `mapstructure:"include_global_db_objects" yaml:"include_global_db_objects"`
+	Role                           string   `mapstructure:"role" yaml:"role"`
+	RolesSnapshotMode              string   `mapstructure:"roles_snapshot_mode" yaml:"roles_snapshot_mode"`
+	NoOwner                        bool     `mapstructure:"no_owner" yaml:"no_owner"`
+	NoPrivileges                   bool     `mapstructure:"no_privileges" yaml:"no_privileges"`
+	DumpFile                       string   `mapstructure:"dump_file" yaml:"dump_file"`
+	ExcludedSecurityLabels         []string `mapstructure:"excluded_security_labels" yaml:"excluded_security_labels"`
+	RefreshMaterializedViews       bool     `mapstructure:"refresh_materialized_views" yaml:"refresh_materialized_views"`
+	IndexConstraintSessionSettings []string `mapstructure:"index_constraint_session_settings" yaml:"index_constraint_session_settings"`
+	IndexRestoreWorkers            uint     `mapstructure:"index_restore_workers" yaml:"index_restore_workers"`
+	IncludeObjectTypes             []string `mapstructure:"include_object_types" yaml:"include_object_types"`
+	ExcludeObjectTypes             []string `mapstructure:"exclude_object_types" yaml:"exclude_object_types"`
+}
+
+type ReplicationConfig struct {
+	ReplicationSlot string        `mapstructure:"replication_slot" yaml:"replication_slot"`
+	Plugin          *PluginConfig `mapstructure:"plugin" yaml:"plugin"`
+}
+
+type PluginConfig struct {
+	IncludeXIDs  bool   `mapstructure:"include_xids" yaml:"include_xids"`
+	AddTables    string `mapstructure:"add_tables" yaml:"add_tables"`
+	FilterTables string `mapstructure:"filter_tables" yaml:"filter_tables"`
+}
+
+type KafkaConfig struct {
+	Servers       []string            `mapstructure:"servers" yaml:"servers"`
+	Topic         TopicConfig         `mapstructure:"topic" yaml:"topic"`
+	ConsumerGroup ConsumerGroupConfig `mapstructure:"consumer_group" yaml:"consumer_group"`
+	TLS           *TLSConfig          `mapstructure:"tls" yaml:"tls"`
+	SASL          *SASLConfig         `mapstructure:"sasl" yaml:"sasl"`
+	Backoff       *BackoffConfig      `mapstructure:"backoff" yaml:"backoff"`
+}
+
+type TopicConfig struct {
+	Name              string `mapstructure:"name" yaml:"name"`
+	Partitions        int    `mapstructure:"partitions" yaml:"partitions"`
+	ReplicationFactor int    `mapstructure:"replication_factor" yaml:"replication_factor"`
+	AutoCreate        bool   `mapstructure:"auto_create" yaml:"auto_create"`
+}
+
+type ConsumerGroupConfig struct {
+	ID          string `mapstructure:"id" yaml:"id"`
+	StartOffset string `mapstructure:"start_offset" yaml:"start_offset"`
+}
+
+type TLSConfig struct {
+	CACert     string `mapstructure:"ca_cert" yaml:"ca_cert"`
+	ClientCert string `mapstructure:"client_cert" yaml:"client_cert"`
+	ClientKey  string `mapstructure:"client_key" yaml:"client_key"`
+}
+
+// SASLConfig holds the SASL authentication settings for the Kafka connection.
+type SASLConfig struct {
+	Mechanism string `mapstructure:"mechanism" yaml:"mechanism"`
+	User      string `mapstructure:"user" yaml:"user"`
+	Password  string `mapstructure:"password" yaml:"password"`
+}
+
+type BackoffConfig struct {
+	DisableRetries bool                      `mapstructure:"disable_retries" yaml:"disable_retries"`
+	Exponential    *ExponentialBackoffConfig `mapstructure:"exponential" yaml:"exponential"`
+	Constant       *ConstantBackoffConfig    `mapstructure:"constant" yaml:"constant"`
+}
+
+type ExponentialBackoffConfig struct {
+	MaxRetries      int `mapstructure:"max_retries" yaml:"max_retries"`
+	InitialInterval int `mapstructure:"initial_interval" yaml:"initial_interval"`
+	MaxInterval     int `mapstructure:"max_interval" yaml:"max_interval"`
+	MaxElapsedTime  int `mapstructure:"max_elapsed_time" yaml:"max_elapsed_time"`
+}
+
+type ConstantBackoffConfig struct {
+	MaxRetries int `mapstructure:"max_retries" yaml:"max_retries"`
+	Interval   int `mapstructure:"interval" yaml:"interval"`
+}
+
+type PostgresTargetConfig struct {
+	URL                   string            `mapstructure:"url" yaml:"url"`
+	MaxConnections        uint              `mapstructure:"max_connections" yaml:"max_connections"`
+	Batch                 *BatchConfig      `mapstructure:"batch" yaml:"batch"`
+	BulkIngest            *BulkIngestConfig `mapstructure:"bulk_ingest" yaml:"bulk_ingest"`
+	DisableTriggers       bool              `mapstructure:"disable_triggers" yaml:"disable_triggers"`
+	OnConflictAction      string            `mapstructure:"on_conflict_action" yaml:"on_conflict_action"`
+	RetryPolicy           BackoffConfig     `mapstructure:"retry_policy" yaml:"retry_policy"`
+	IgnoreDDL             bool              `mapstructure:"ignore_ddl" yaml:"ignore_ddl"`
+	StrictMode            bool              `mapstructure:"strict_mode" yaml:"strict_mode"`
+	IncludeDDLObjectTypes []string          `mapstructure:"include_ddl_object_types" yaml:"include_ddl_object_types"`
+	ExcludeDDLObjectTypes []string          `mapstructure:"exclude_ddl_object_types" yaml:"exclude_ddl_object_types"`
+}
+
+type KafkaTargetConfig struct {
+	Servers []string         `mapstructure:"servers" yaml:"servers"`
+	Topic   KafkaTopicConfig `mapstructure:"topic" yaml:"topic"`
+	TLS     *TLSConfig       `mapstructure:"tls" yaml:"tls"`
+	SASL    *SASLConfig      `mapstructure:"sasl" yaml:"sasl"`
+	Batch   *BatchConfig     `mapstructure:"batch" yaml:"batch"`
+}
+
+type KafkaTopicConfig struct {
+	Name              string `mapstructure:"name" yaml:"name"`
+	Partitions        int    `mapstructure:"partitions" yaml:"partitions"`
+	ReplicationFactor int    `mapstructure:"replication_factor" yaml:"replication_factor"`
+	AutoCreate        bool   `mapstructure:"auto_create" yaml:"auto_create"`
+	PartitionKey      string `mapstructure:"partition_key" yaml:"partition_key"`
+}
+
+type SearchConfig struct {
+	Engine     string           `mapstructure:"engine" yaml:"engine"`
+	URL        string           `mapstructure:"url" yaml:"url"`
+	Batch      *BatchConfig     `mapstructure:"batch" yaml:"batch"`
+	Backoff    *BackoffConfig   `mapstructure:"backoff" yaml:"backoff"`
+	HashDocIDs bool             `mapstructure:"hash_doc_ids" yaml:"hash_doc_ids"`
+	TLS        *SearchTLSConfig `mapstructure:"tls" yaml:"tls"`
+}
+
+// SearchTLSConfig configures the HTTPS transport used to talk to the search
+// store.
+type SearchTLSConfig struct {
+	CACert             string `mapstructure:"ca_cert" yaml:"ca_cert"`
+	ClientCert         string `mapstructure:"client_cert" yaml:"client_cert"`
+	ClientKey          string `mapstructure:"client_key" yaml:"client_key"`
+	InsecureSkipVerify bool   `mapstructure:"insecure_skip_verify" yaml:"insecure_skip_verify"`
+}
+
+type BatchConfig struct {
+	Timeout          int                  `mapstructure:"timeout" yaml:"timeout"`
+	Size             int                  `mapstructure:"size" yaml:"size"`
+	MaxBytes         byteSize             `mapstructure:"max_bytes" yaml:"max_bytes"`
+	MaxQueueBytes    byteSize             `mapstructure:"max_queue_bytes" yaml:"max_queue_bytes"`
+	IgnoreSendErrors bool                 `mapstructure:"ignore_send_errors" yaml:"ignore_send_errors"`
+	AutoTune         *BatchAutoTuneConfig `mapstructure:"auto_tune" yaml:"auto_tune"`
+}
+
+type BatchAutoTuneConfig struct {
+	Enabled              bool     `mapstructure:"enabled" yaml:"enabled"`
+	MaxBatchBytes        byteSize `mapstructure:"max_batch_bytes" yaml:"max_batch_bytes"`
+	MinBatchBytes        byteSize `mapstructure:"min_batch_bytes" yaml:"min_batch_bytes"`
+	ConvergenceThreshold float64  `mapstructure:"convergence_threshold" yaml:"convergence_threshold"`
+}
+
+type BulkIngestConfig struct {
+	Enabled bool `mapstructure:"enabled" yaml:"enabled"`
+	// CopyWorkers is the number of concurrent COPY streams (send drainers) used
+	// per table when bulk ingesting. Defaults to 8. It names the write-side
+	// COPY streams, distinct from snapshot.data.table_workers which is the
+	// read-side page-range reader count.
+	CopyWorkers int `mapstructure:"copy_workers" yaml:"copy_workers"`
+}
+
+type WebhooksConfig struct {
+	Subscriptions WebhookSubscriptionsConfig `mapstructure:"subscriptions" yaml:"subscriptions"`
+	Notifier      WebhookNotifierConfig      `mapstructure:"notifier" yaml:"notifier"`
+}
+
+type WebhookSubscriptionsConfig struct {
+	Store  WebhookStoreConfig  `mapstructure:"store" yaml:"store"`
+	Server WebhookServerConfig `mapstructure:"server" yaml:"server"`
+}
+
+type WebhookStoreConfig struct {
+	URL   string              `mapstructure:"url" yaml:"url"`
+	Cache *WebhookCacheConfig `mapstructure:"cache" yaml:"cache"`
+}
+
+type WebhookCacheConfig struct {
+	Enabled         bool `mapstructure:"enabled" yaml:"enabled"`
+	RefreshInterval int  `mapstructure:"refresh_interval" yaml:"refresh_interval"`
+}
+
+type WebhookServerConfig struct {
+	Address      string `mapstructure:"address" yaml:"address"`
+	ReadTimeout  int    `mapstructure:"read_timeout" yaml:"read_timeout"`
+	WriteTimeout int    `mapstructure:"write_timeout" yaml:"write_timeout"`
+}
+
+type WebhookNotifierConfig struct {
+	WorkerCount   int            `mapstructure:"worker_count" yaml:"worker_count"`
+	ClientTimeout int            `mapstructure:"client_timeout" yaml:"client_timeout"`
+	Backoff       *BackoffConfig `mapstructure:"backoff" yaml:"backoff"`
+	StrictMode    bool           `mapstructure:"strict_mode" yaml:"strict_mode"`
+}
+
+type SanitizeConfig struct {
+	StripNullCharBytes bool `mapstructure:"strip_null_char_bytes" yaml:"strip_null_char_bytes"`
+}
+
+type ModifiersConfig struct {
+	Injector        *InjectorConfig        `mapstructure:"injector" yaml:"injector"`
+	Transformations *TransformationsConfig `mapstructure:"transformations" yaml:"transformations"`
+	Filter          *FilterConfig          `mapstructure:"filter" yaml:"filter"`
+	Sanitize        *SanitizeConfig        `mapstructure:"sanitize" yaml:"sanitize"`
+}
+
+type InjectorConfig struct {
+	Enabled   bool   `mapstructure:"enabled" yaml:"enabled"`
+	SourceURL string `mapstructure:"source_url" yaml:"source_url"`
+}
+
+type FilterConfig struct {
+	IncludeTables    []string `mapstructure:"include_tables" yaml:"include_tables"`
+	ExcludeTables    []string `mapstructure:"exclude_tables" yaml:"exclude_tables"`
+	SchemaOnlyTables []string `mapstructure:"schema_only_tables" yaml:"schema_only_tables"`
+}
+
+type TransformationsConfig struct {
+	InferFromSecurityLabels bool                      `mapstructure:"infer_from_security_labels" yaml:"infer_from_security_labels"`
+	DumpInferredRules       bool                      `mapstructure:"dump_inferred_rules" yaml:"dump_inferred_rules"`
+	TransformerRules        []TableTransformersConfig `mapstructure:"table_transformers" yaml:"table_transformers"`
+	ValidationMode          string                    `mapstructure:"validation_mode" yaml:"validation_mode"`
+	OnError                 string                    `mapstructure:"on_error" yaml:"on_error"`
+}
+type TableTransformersConfig struct {
+	Schema         string                              `mapstructure:"schema" yaml:"schema"`
+	Table          string                              `mapstructure:"table" yaml:"table"`
+	ColumnRules    map[string]ColumnTransformersConfig `mapstructure:"column_transformers" yaml:"column_transformers"`
+	ValidationMode string                              `mapstructure:"validation_mode" yaml:"validation_mode"`
+}
+
+type ColumnTransformersConfig struct {
+	Name                string              `mapstructure:"name" yaml:"name"`
+	Parameters          map[string]any      `mapstructure:"parameters" yaml:"parameters"`
+	DynamicParameters   map[string]any      `mapstructure:"dynamic_parameters" yaml:"dynamic_parameters"`
+	AllowUniquenessLoss bool                `mapstructure:"allow_uniqueness_loss" yaml:"allow_uniqueness_loss"`
+	ArrayOptions        *ArrayOptionsConfig `mapstructure:"array_options" yaml:"array_options"`
+}
+
+// ArrayOptionsConfig configures how an array column's elements are produced.
+// The counts are pointers so that a count set to zero is distinguishable from
+// a count left out, which the transformation rules validate differently.
+type ArrayOptionsConfig struct {
+	Generator string `mapstructure:"generator" yaml:"generator"`
+	MinCount  *int   `mapstructure:"min_count" yaml:"min_count"`
+	MaxCount  *int   `mapstructure:"max_count" yaml:"max_count"`
+}
+
+// postgres source modes
+const (
+	replicationMode            = "replication"
+	snapshotMode               = "snapshot"
+	snapshotAndReplicationMode = "snapshot_and_replication"
+)
+
+// snapshot modes
+const (
+	fullSnapshotMode   = "full"
+	dataSnapshotMode   = "data"
+	schemaSnapshotMode = "schema"
+)
+
+// roles snapshot modes
+const (
+	enabledRolesSnapshotMode     = "enabled"
+	disabledRolesSnapshotMode    = "disabled"
+	noPasswordsRolesSnapshotMode = "no_passwords"
+)
+
+// search engines
+const (
+	elasticsearchEngine = "elasticsearch"
+	opensearchEngine    = "opensearch"
+)
+
+// transformer validation modes
+const (
+	strictValidationMode     = "strict"
+	tableLevelValidationMode = "table_level"
+	relaxedValidationMode    = "relaxed"
+)
+
+// transformer on-error policies
+const (
+	failOnError        = transformer.OnErrorFail
+	passThroughOnError = transformer.OnErrorPassThrough
+	nullOnError        = transformer.OnErrorNull
+)
+
+var (
+	errUnsupportedSnapshotMode                 = errors.New("unsupported snapshot mode, must be one of 'full', 'schema' or 'data'")
+	errUnsupportedPostgresSourceMode           = errors.New("unsupported postgres source mode, must be one of 'replication', 'snapshot' or 'snapshot_and_replication'")
+	errUnsupportedTransformationValidationMode = errors.New("unsupported transformation validation mode, must be one of 'strict', 'table_level' or 'relaxed'")
+	errUnsupportedTableValidationMode          = errors.New("unsupported table level validation mode, must be either 'strict' or 'relaxed'")
+	errUnsupportedTransformationOnError        = errors.New("unsupported transformation on_error policy, must be one of 'fail', 'pass-through' or 'null'")
+	errTableTransformersNotProvided            = errors.New("table_transformers must be provided when transformation config is set")
+	errInvalidTableValidationConfig            = errors.New("table level validation mode should be used when transformation validation mode is set to 'table_level'")
+	errUnsupportedSearchEngine                 = errors.New("unsupported search engine, must be one of 'opensearch' or 'elasticsearch'")
+	errUnsupportedRolesSnapshotMode            = errors.New("unsupported roles snapshot mode, must be one of 'enabled', 'disabled', or 'no_passwords'")
+	errInvalidInjectorConfig                   = errors.New("injector config can't infer source url, must be provided")
+	errInvalidSnapshotRecorderConfig           = errors.New("snapshot recorder config requires a postgres url")
+	errInvalidSampleRatio                      = errors.New("trace sample ratio must be a value between 0.0 and 1.0")
+	errSchemaSnapshotNotConfigured             = errors.New("schema snapshot config must be provided when snapshot mode is 'full' or 'schema'")
+	errSchemaOnlyTablesSnapshotMode            = errors.New("snapshot schema_only_tables can only be used when snapshot mode is 'full' or 'schema'")
+)
+
+func (c *InstrumentationConfig) toHealthConfig() *health.Config {
+	if c.Health == nil {
+		return &health.Config{}
+	}
+	return &health.Config{
+		Enabled: c.Health.Enabled,
+		Address: c.Health.Address,
+	}
+}
+
+func (c *InstrumentationConfig) toOtelConfig() (*otel.Config, error) {
+	cfg := &otel.Config{}
+	if c.Metrics != nil {
+		metricsCfg := &otel.MetricsConfig{
+			Endpoint:           c.Metrics.Endpoint,
+			CollectionInterval: time.Duration(c.Metrics.CollectionInterval) * time.Second,
+			Prometheus:         nil,
+		}
+		if c.Metrics.Prometheus != nil {
+			metricsCfg.Prometheus = &otel.PrometheusConfig{
+				Enabled:  c.Metrics.Prometheus.Enabled,
+				Endpoint: c.Metrics.Prometheus.Endpoint,
+			}
+		}
+		cfg.Metrics = metricsCfg
+	}
+
+	if c.Traces != nil {
+		if c.Traces.SampleRatio < 0.0 || c.Traces.SampleRatio > 1.0 {
+			return nil, errInvalidSampleRatio
+		}
+		cfg.Traces = &otel.TracesConfig{
+			Endpoint:    c.Traces.Endpoint,
+			SampleRatio: c.Traces.SampleRatio,
+		}
+	}
+
+	return cfg, nil
+}
+
+func (c *YAMLConfig) toStreamConfig() (*stream.Config, error) {
+	listener, err := c.parseListenerConfig()
+	if err != nil {
+		return nil, fmt.Errorf("parsing source config: %w", err)
+	}
+
+	processor, err := c.parseProcessorConfig()
+	if err != nil {
+		return nil, fmt.Errorf("parsing target and modifier config: %w", err)
+	}
+	return &stream.Config{
+		Listener:  listener,
+		Processor: processor,
+	}, nil
+}
+
+func (c *YAMLConfig) parseListenerConfig() (stream.ListenerConfig, error) {
+	pgCfg, err := c.parsePostgresListenerConfig()
+	if err != nil {
+		return stream.ListenerConfig{}, fmt.Errorf("parsing postgres listener config: %w", err)
+	}
+
+	return stream.ListenerConfig{
+		Kafka:    c.Source.Kafka.parseKafkaListenerConfig(),
+		Postgres: pgCfg,
+	}, nil
+}
+
+func (c *YAMLConfig) parseProcessorConfig() (stream.ProcessorConfig, error) {
+	streamCfg := stream.ProcessorConfig{
+		Kafka:    c.parseKafkaProcessorConfig(),
+		Postgres: c.parsePostgresProcessorConfig(),
+		Webhook:  c.parseWebhookProcessorConfig(),
+		Stdout:   c.parseStdoutProcessorConfig(),
+		Filter:   c.parseFilterConfig(),
+		Sanitize: c.parseSanitizeConfig(),
+	}
+
+	var err error
+	streamCfg.Injector, err = c.parseInjectorConfig()
+	if err != nil {
+		return stream.ProcessorConfig{}, err
+	}
+
+	streamCfg.Search, err = c.parseSearchProcessorConfig()
+	if err != nil {
+		return stream.ProcessorConfig{}, err
+	}
+
+	streamCfg.Transformer, err = c.parseTransformationConfig()
+	if err != nil {
+		return stream.ProcessorConfig{}, err
+	}
+
+	return streamCfg, nil
+}
+
+func (c *YAMLConfig) parsePostgresListenerConfig() (*stream.PostgresListenerConfig, error) {
+	if c.Source.Postgres == nil {
+		return nil, nil
+	}
+
+	switch c.Source.Postgres.Mode {
+	case replicationMode, snapshotAndReplicationMode, snapshotMode:
+	default:
+		return nil, errUnsupportedPostgresSourceMode
+	}
+
+	streamCfg := &stream.PostgresListenerConfig{
+		URL:         c.Source.Postgres.URL,
+		RetryPolicy: c.Source.Postgres.RetryPolicy.parseBackoffConfig(),
+	}
+
+	if c.Source.Postgres.Mode == replicationMode || c.Source.Postgres.Mode == snapshotAndReplicationMode {
+		replicationSlotName := ""
+		pluginArgs := pgreplication.PluginArguments{}
+		if c.Source.Postgres.Replication != nil {
+			replicationSlotName = c.Source.Postgres.Replication.ReplicationSlot
+			if c.Source.Postgres.Replication.Plugin != nil {
+				pluginArgs.IncludeXIDs = c.Source.Postgres.Replication.Plugin.IncludeXIDs
+				pluginArgs.AddTables = c.Source.Postgres.Replication.Plugin.AddTables
+				pluginArgs.FilterTables = c.Source.Postgres.Replication.Plugin.FilterTables
+			}
+		}
+		streamCfg.Replication = pgreplication.Config{
+			PostgresURL:         c.Source.Postgres.URL,
+			ReplicationSlotName: replicationSlotName,
+			PluginArguments:     pluginArgs,
+		}
+
+	}
+
+	if c.Source.Postgres.Mode == snapshotMode || c.Source.Postgres.Mode == snapshotAndReplicationMode {
+		var err error
+		streamCfg.Snapshot, err = c.parseSnapshotConfig()
+		if err != nil {
+			return &stream.PostgresListenerConfig{}, fmt.Errorf("parsing postgres snapshot listener config: %w", err)
+		}
+	}
+
+	// if there's a filter config, apply it to the replication config so that
+	// "no tuple identifier" warnings are suppressed for tables whose data
+	// events are filtered out anyway
+	if c.Modifiers.Filter != nil {
+		streamCfg.Replication.ExcludeTables = c.Modifiers.Filter.ExcludeTables
+		streamCfg.Replication.IncludeTables = c.Modifiers.Filter.IncludeTables
+		streamCfg.Replication.SchemaOnlyTables = c.Modifiers.Filter.SchemaOnlyTables
+	}
+
+	return streamCfg, nil
+}
+
+func (c *YAMLConfig) parseSnapshotConfig() (*snapshotbuilder.SnapshotListenerConfig, error) {
+	snapshotConfig := c.Source.Postgres.Snapshot
+	if snapshotConfig == nil {
+		return nil, nil
+	}
+
+	streamCfg := &snapshotbuilder.SnapshotListenerConfig{
+		Adapter: adapter.SnapshotConfig{
+			Tables:           snapshotConfig.Tables,
+			ExcludedTables:   snapshotConfig.ExcludedTables,
+			SchemaOnlyTables: snapshotConfig.SchemaOnlyTables,
+		},
+		DisableProgressTracking: snapshotConfig.DisableProgressTracking,
+	}
+
+	if snapshotConfig.Recorder != nil {
+		if snapshotConfig.Recorder.PostgresURL == "" {
+			return nil, errInvalidSnapshotRecorderConfig
+		}
+
+		streamCfg.Recorder = &snapshotbuilder.SnapshotRecorderConfig{
+			RepeatableSnapshots: snapshotConfig.Recorder.RepeatableSnapshots,
+			SnapshotStoreURL:    snapshotConfig.Recorder.PostgresURL,
+			SnapshotWorkers:     uint(snapshotConfig.SnapshotWorkers),
+		}
+	}
+
+	switch snapshotConfig.Mode {
+	case fullSnapshotMode, dataSnapshotMode, schemaSnapshotMode:
+	case "":
+		snapshotConfig.Mode = fullSnapshotMode
+	default:
+		return nil, errUnsupportedSnapshotMode
+	}
+
+	if snapshotConfig.Mode == dataSnapshotMode && len(snapshotConfig.SchemaOnlyTables) > 0 {
+		return nil, errSchemaOnlyTablesSnapshotMode
+	}
+
+	if snapshotConfig.Mode == fullSnapshotMode || snapshotConfig.Mode == dataSnapshotMode {
+		streamCfg.Data = c.parseDataSnapshotConfig()
+	}
+
+	if snapshotConfig.Mode == fullSnapshotMode || snapshotConfig.Mode == schemaSnapshotMode {
+		var err error
+		streamCfg.Schema, err = c.parseSchemaSnapshotConfig()
+		if err != nil {
+			return nil, err
+		}
+		if streamCfg.Schema == nil {
+			return nil, errSchemaSnapshotNotConfigured
+		}
+	}
+
+	return streamCfg, nil
+}
+
+func (c *YAMLConfig) parseDataSnapshotConfig() *pgsnapshotgenerator.Config {
+	snapshotCfg := c.Source.Postgres.Snapshot
+	streamCfg := &pgsnapshotgenerator.Config{
+		URL:             c.Source.Postgres.URL,
+		SnapshotWorkers: uint(snapshotCfg.SnapshotWorkers),
+	}
+
+	if snapshotCfg.Data != nil {
+		streamCfg.BatchBytes = uint64(snapshotCfg.Data.BatchBytes)
+		streamCfg.SchemaWorkers = uint(snapshotCfg.Data.SchemaWorkers)
+		streamCfg.TableWorkers = uint(snapshotCfg.Data.TableWorkers)
+		streamCfg.MaxConnections = snapshotCfg.Data.MaxConnections
+	}
+
+	return streamCfg
+}
+
+func (c *YAMLConfig) parseSchemaSnapshotConfig() (*snapshotbuilder.SchemaSnapshotConfig, error) {
+	schemaSnapshotCfg := c.Source.Postgres.Snapshot.Schema
+	if schemaSnapshotCfg == nil {
+		return nil, nil
+	}
+
+	targetURL := ""
+	if c.Target.Postgres != nil {
+		targetURL = c.Target.Postgres.URL
+	}
+	streamSchemaCfg := &snapshotbuilder.SchemaSnapshotConfig{
+		DumpRestore: &pgdumprestore.Config{
+			SourcePGURL: c.Source.Postgres.URL,
+			TargetPGURL: targetURL,
+		},
+	}
+
+	if schemaSnapshotCfg.PgDumpPgRestore != nil {
+		streamSchemaCfg.DumpRestore.CleanTargetDB = schemaSnapshotCfg.PgDumpPgRestore.CleanTargetDB
+		streamSchemaCfg.DumpRestore.IncludeGlobalDBObjects = schemaSnapshotCfg.PgDumpPgRestore.IncludeGlobalDBObjects
+		streamSchemaCfg.DumpRestore.CreateTargetDB = schemaSnapshotCfg.PgDumpPgRestore.CreateTargetDB
+		streamSchemaCfg.DumpRestore.Role = schemaSnapshotCfg.PgDumpPgRestore.Role
+		streamSchemaCfg.DumpRestore.NoOwner = schemaSnapshotCfg.PgDumpPgRestore.NoOwner
+		streamSchemaCfg.DumpRestore.NoPrivileges = schemaSnapshotCfg.PgDumpPgRestore.NoPrivileges
+		streamSchemaCfg.DumpRestore.DumpDebugFile = schemaSnapshotCfg.PgDumpPgRestore.DumpFile
+		streamSchemaCfg.DumpRestore.ExcludedSecurityLabels = schemaSnapshotCfg.PgDumpPgRestore.ExcludedSecurityLabels
+		streamSchemaCfg.DumpRestore.RefreshMaterializedViews = schemaSnapshotCfg.PgDumpPgRestore.RefreshMaterializedViews
+		streamSchemaCfg.DumpRestore.IndexConstraintSessionSettings = schemaSnapshotCfg.PgDumpPgRestore.IndexConstraintSessionSettings
+		streamSchemaCfg.DumpRestore.IndexRestoreWorkers = schemaSnapshotCfg.PgDumpPgRestore.IndexRestoreWorkers
+		streamSchemaCfg.DumpRestore.IncludeObjectTypes = schemaSnapshotCfg.PgDumpPgRestore.IncludeObjectTypes
+		streamSchemaCfg.DumpRestore.ExcludeObjectTypes = schemaSnapshotCfg.PgDumpPgRestore.ExcludeObjectTypes
+
+		var err error
+		streamSchemaCfg.DumpRestore.RolesSnapshotMode, err = getRolesSnapshotMode(schemaSnapshotCfg.PgDumpPgRestore.RolesSnapshotMode)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	return streamSchemaCfg, nil
+}
+
+func (c *YAMLConfig) parseInjectorConfig() (*injector.Config, error) {
+	if c.Modifiers.Injector == nil || !c.Modifiers.Injector.Enabled {
+		return nil, nil
+	}
+
+	url := c.Modifiers.Injector.SourceURL
+	if url == "" {
+		if c.Source.Postgres == nil || c.Source.Postgres.URL == "" {
+			return nil, errInvalidInjectorConfig
+		}
+		url = c.Source.Postgres.URL
+	}
+
+	return &injector.Config{
+		URL: url,
+	}, nil
+}
+
+func (c *YAMLConfig) parseKafkaProcessorConfig() *stream.KafkaProcessorConfig {
+	if c.Target.Kafka == nil {
+		return nil
+	}
+
+	return &stream.KafkaProcessorConfig{
+		Writer: &kafkaprocessor.Config{
+			Kafka: kafka.ConnConfig{
+				Servers: c.Target.Kafka.Servers,
+				Topic: kafka.TopicConfig{
+					Name:              c.Target.Kafka.Topic.Name,
+					NumPartitions:     c.Target.Kafka.Topic.Partitions,
+					ReplicationFactor: c.Target.Kafka.Topic.ReplicationFactor,
+					AutoCreate:        c.Target.Kafka.Topic.AutoCreate,
+				},
+				TLS:  c.Target.Kafka.TLS.parseTLSConfig(),
+				SASL: c.Target.Kafka.SASL.parseSASLConfig(),
+			},
+			Batch:        c.Target.Kafka.Batch.parseBatchConfig(),
+			PartitionKey: kafkaprocessor.PartitionKey(c.Target.Kafka.Topic.PartitionKey),
+		},
+	}
+}
+
+func (c *YAMLConfig) parseStdoutProcessorConfig() *stream.StdoutProcessorConfig {
+	if c.Target.Stdout == nil {
+		return nil
+	}
+	return &stream.StdoutProcessorConfig{}
+}
+
+func (c *YAMLConfig) parsePostgresProcessorConfig() *stream.PostgresProcessorConfig {
+	if c.Target.Postgres == nil {
+		return nil
+	}
+
+	cfg := &stream.PostgresProcessorConfig{
+		BatchWriter: postgres.Config{
+			URL:                   c.Target.Postgres.URL,
+			MaxConnections:        c.Target.Postgres.MaxConnections,
+			BatchConfig:           c.Target.Postgres.Batch.parseBatchConfig(),
+			DisableTriggers:       c.Target.Postgres.DisableTriggers,
+			OnConflictAction:      c.Target.Postgres.OnConflictAction,
+			RetryPolicy:           c.Target.Postgres.RetryPolicy.parseBackoffConfig(),
+			IgnoreDDL:             c.Target.Postgres.IgnoreDDL,
+			StrictMode:            c.Target.Postgres.StrictMode,
+			IncludeDDLObjectTypes: c.Target.Postgres.IncludeDDLObjectTypes,
+			ExcludeDDLObjectTypes: c.Target.Postgres.ExcludeDDLObjectTypes,
+		},
+	}
+
+	if c.Target.Postgres.BulkIngest != nil {
+		cfg.BatchWriter.BulkIngestEnabled = c.Target.Postgres.BulkIngest.Enabled
+		if cfg.BatchWriter.BulkIngestEnabled {
+			cfg.BatchWriter.BatchConfig.SendConcurrency = c.Target.Postgres.BulkIngest.CopyWorkers
+			applyPostgresBulkBatchDefaults(&cfg.BatchWriter.BatchConfig)
+		}
+	}
+
+	return cfg
+}
+
+func (c *YAMLConfig) parseSearchProcessorConfig() (*stream.SearchProcessorConfig, error) {
+	if c.Target.Search == nil {
+		return nil, nil
+	}
+
+	storeCfg := store.Config{}
+
+	switch c.Target.Search.Engine {
+	case elasticsearchEngine:
+		storeCfg.ElasticsearchURL = c.Target.Search.URL
+	case opensearchEngine:
+		storeCfg.OpenSearchURL = c.Target.Search.URL
+	default:
+		return nil, errUnsupportedSearchEngine
+	}
+
+	if tlsCfg := c.Target.Search.TLS; tlsCfg != nil {
+		storeCfg.TLS = tls.Config{
+			Enabled:            true,
+			CaCertFile:         tlsCfg.CACert,
+			ClientCertFile:     tlsCfg.ClientCert,
+			ClientKeyFile:      tlsCfg.ClientKey,
+			InsecureSkipVerify: tlsCfg.InsecureSkipVerify,
+		}
+	}
+
+	return &stream.SearchProcessorConfig{
+		Store: storeCfg,
+		Indexer: search.IndexerConfig{
+			Batch:      c.Target.Search.Batch.parseBatchConfig(),
+			HashDocIDs: c.Target.Search.HashDocIDs,
+		},
+		Retrier: search.StoreRetryConfig{
+			Backoff: c.Target.Search.Backoff.parseBackoffConfig(),
+		},
+	}, nil
+}
+
+func (c *YAMLConfig) parseWebhookProcessorConfig() *stream.WebhookProcessorConfig {
+	if c.Target.Webhooks == nil {
+		return nil
+	}
+	streamCfg := &stream.WebhookProcessorConfig{
+		SubscriptionStore: stream.WebhookSubscriptionStoreConfig{
+			URL: c.Target.Webhooks.Subscriptions.Store.URL,
+		},
+		Notifier: notifier.Config{
+			URLWorkerCount: uint(c.Target.Webhooks.Notifier.WorkerCount),
+			ClientTimeout:  time.Duration(c.Target.Webhooks.Notifier.ClientTimeout) * time.Millisecond,
+			StrictMode:     c.Target.Webhooks.Notifier.StrictMode,
+		},
+		SubscriptionServer: server.Config{
+			Address:      c.Target.Webhooks.Subscriptions.Server.Address,
+			ReadTimeout:  time.Duration(c.Target.Webhooks.Subscriptions.Server.ReadTimeout) * time.Second,
+			WriteTimeout: time.Duration(c.Target.Webhooks.Subscriptions.Server.WriteTimeout) * time.Second,
+		},
+	}
+
+	if c.Target.Webhooks.Subscriptions.Store.Cache != nil {
+		streamCfg.SubscriptionStore.CacheEnabled = c.Target.Webhooks.Subscriptions.Store.Cache.Enabled
+		streamCfg.SubscriptionStore.CacheRefreshInterval = time.Duration(c.Target.Webhooks.Subscriptions.Store.Cache.RefreshInterval) * time.Second
+	}
+
+	if c.Target.Webhooks.Notifier.Backoff != nil {
+		streamCfg.Notifier.Backoff = c.Target.Webhooks.Notifier.Backoff.parseBackoffConfig()
+	}
+
+	return streamCfg
+}
+
+func (c *YAMLConfig) parseTransformationConfig() (*transformer.Config, error) {
+	if c.Modifiers.Transformations == nil {
+		// no transformers configured
+		return nil, nil
+	}
+
+	return c.Modifiers.Transformations.parseTransformationConfig()
+}
+
+func (c YAMLConfig) parseFilterConfig() *filter.Config {
+	if c.Modifiers.Filter == nil {
+		return nil
+	}
+	return &filter.Config{
+		ExcludeTables:    c.Modifiers.Filter.ExcludeTables,
+		IncludeTables:    c.Modifiers.Filter.IncludeTables,
+		SchemaOnlyTables: c.Modifiers.Filter.SchemaOnlyTables,
+	}
+}
+
+func (c YAMLConfig) parseSanitizeConfig() *stream.SanitizeConfig {
+	if c.Modifiers.Sanitize == nil || !c.Modifiers.Sanitize.StripNullCharBytes {
+		return nil
+	}
+	return &stream.SanitizeConfig{
+		StripNullCharBytes: c.Modifiers.Sanitize.StripNullCharBytes,
+	}
+}
+
+func (c TransformationsConfig) parseTransformationConfig() (*transformer.Config, error) {
+	if c.TransformerRules == nil && !c.InferFromSecurityLabels {
+		// transformation configuration provided, but no rules defined
+		return nil, errTableTransformersNotProvided
+	}
+
+	var globalValidationMode string
+	switch c.ValidationMode {
+	case strictValidationMode, relaxedValidationMode, tableLevelValidationMode:
+		globalValidationMode = c.ValidationMode
+	case "":
+		globalValidationMode = relaxedValidationMode
+	default:
+		return nil, errUnsupportedTransformationValidationMode
+	}
+
+	var onError string
+	switch c.OnError {
+	case failOnError, passThroughOnError, nullOnError:
+		onError = c.OnError
+	case "":
+		onError = nullOnError
+	default:
+		return nil, errUnsupportedTransformationOnError
+	}
+
+	if c.InferFromSecurityLabels {
+		return &transformer.Config{
+			InferFromSecurityLabels: true,
+			DumpInferredRules:       c.DumpInferredRules,
+			TransformerRules:        nil,
+			ValidationMode:          globalValidationMode,
+			OnError:                 onError,
+		}, nil
+	}
+
+	if len(c.TransformerRules) == 0 {
+		// no transformers configured
+		return nil, nil
+	}
+
+	rules := make([]transformer.TableRules, 0, len(c.TransformerRules))
+	for _, t := range c.TransformerRules {
+		var tableValidationMode string
+		switch t.ValidationMode {
+		case strictValidationMode, relaxedValidationMode:
+			if globalValidationMode != tableLevelValidationMode {
+				return nil, errInvalidTableValidationConfig
+			}
+			tableValidationMode = t.ValidationMode
+		case "":
+			if globalValidationMode == tableLevelValidationMode {
+				return nil, errInvalidTableValidationConfig
+			}
+			tableValidationMode = globalValidationMode
+		default:
+			return nil, errUnsupportedTableValidationMode
+		}
+
+		columnRules := make(map[string]transformer.TransformerRules, len(t.ColumnRules))
+		for column, cr := range t.ColumnRules {
+			columnRules[column] = transformer.TransformerRules{
+				Name:                cr.Name,
+				Parameters:          cr.Parameters,
+				DynamicParameters:   cr.DynamicParameters,
+				AllowUniquenessLoss: cr.AllowUniquenessLoss,
+				ArrayOptions:        cr.ArrayOptions.toTransformerRules(),
+			}
+		}
+		rules = append(rules, transformer.TableRules{
+			Schema:         t.Schema,
+			Table:          t.Table,
+			ColumnRules:    columnRules,
+			ValidationMode: tableValidationMode,
+		})
+	}
+
+	return &transformer.Config{
+		TransformerRules: rules,
+		ValidationMode:   globalValidationMode,
+		OnError:          onError,
+	}, nil
+}
+
+func (c *KafkaConfig) parseKafkaListenerConfig() *stream.KafkaListenerConfig {
+	if c == nil {
+		return nil
+	}
+
+	return &stream.KafkaListenerConfig{
+		Reader: c.parseKafkaReaderConfig(),
+		Checkpointer: kafkacheckpoint.Config{
+			CommitBackoff: c.Backoff.parseBackoffConfig(),
+		},
+	}
+}
+
+func (c *KafkaConfig) parseKafkaReaderConfig() kafka.ReaderConfig {
+	if c == nil {
+		return kafka.ReaderConfig{}
+	}
+	return kafka.ReaderConfig{
+		Conn: kafka.ConnConfig{
+			Servers: c.Servers,
+			Topic: kafka.TopicConfig{
+				Name:              c.Topic.Name,
+				NumPartitions:     c.Topic.Partitions,
+				ReplicationFactor: c.Topic.ReplicationFactor,
+				AutoCreate:        c.Topic.AutoCreate,
+			},
+			TLS:  c.TLS.parseTLSConfig(),
+			SASL: c.SASL.parseSASLConfig(),
+		},
+		ConsumerGroupID:          c.ConsumerGroup.ID,
+		ConsumerGroupStartOffset: c.ConsumerGroup.StartOffset,
+	}
+}
+
+func (t *TLSConfig) parseTLSConfig() tls.Config {
+	if t == nil {
+		return tls.Config{Enabled: false}
+	}
+	return tls.Config{
+		Enabled:        true,
+		CaCertFile:     t.CACert,
+		ClientCertFile: t.ClientCert,
+		ClientKeyFile:  t.ClientKey,
+	}
+}
+
+// parseSASLConfig maps the YAML SASL settings to the Kafka connection
+// configuration. SASL is enabled when the sasl section is present.
+func (s *SASLConfig) parseSASLConfig() kafka.SASLConfig {
+	if s == nil {
+		return kafka.SASLConfig{Enabled: false}
+	}
+	return kafka.SASLConfig{
+		Enabled:   true,
+		Mechanism: s.Mechanism,
+		Username:  s.User,
+		Password:  s.Password,
+	}
+}
+
+func (bo *BackoffConfig) parseBackoffConfig() backoff.Config {
+	return backoff.Config{
+		DisableRetries: bo.DisableRetries,
+		Exponential:    bo.parseExponentialBackoffConfig(),
+		Constant:       bo.parseConstantBackoffConfig(),
+	}
+}
+
+func (bo *BackoffConfig) parseExponentialBackoffConfig() *backoff.ExponentialConfig {
+	if bo == nil || bo.Exponential == nil {
+		return nil
+	}
+	return &backoff.ExponentialConfig{
+		InitialInterval: time.Duration(bo.Exponential.InitialInterval) * time.Millisecond,
+		MaxInterval:     time.Duration(bo.Exponential.MaxInterval) * time.Millisecond,
+		MaxElapsedTime:  time.Duration(bo.Exponential.MaxElapsedTime) * time.Millisecond,
+		MaxRetries:      uint(bo.Exponential.MaxRetries),
+	}
+}
+
+func (bo *BackoffConfig) parseConstantBackoffConfig() *backoff.ConstantConfig {
+	if bo == nil || bo.Constant == nil {
+		return nil
+	}
+	return &backoff.ConstantConfig{
+		Interval:   time.Duration(bo.Constant.Interval) * time.Millisecond,
+		MaxRetries: uint(bo.Constant.MaxRetries),
+	}
+}
+
+func (bc *BatchConfig) parseBatchConfig() batch.Config {
+	if bc == nil {
+		return batch.Config{}
+	}
+
+	cfg := batch.Config{
+		BatchTimeout:     time.Duration(bc.Timeout) * time.Millisecond,
+		MaxBatchBytes:    int64(bc.MaxBytes),
+		MaxQueueBytes:    int64(bc.MaxQueueBytes),
+		MaxBatchSize:     int64(bc.Size),
+		IgnoreSendErrors: bc.IgnoreSendErrors,
+	}
+
+	if bc.AutoTune != nil {
+		cfg.AutoTune = batch.AutoTuneConfig{
+			Enabled:              bc.AutoTune.Enabled,
+			MinBatchBytes:        int64(bc.AutoTune.MinBatchBytes),
+			MaxBatchBytes:        int64(bc.AutoTune.MaxBatchBytes),
+			ConvergenceThreshold: bc.AutoTune.ConvergenceThreshold,
+		}
+	}
+
+	return cfg
+}
+
+func (c *ArrayOptionsConfig) toTransformerRules() *transformer.ArrayOptions {
+	if c == nil {
+		return nil
+	}
+	return &transformer.ArrayOptions{
+		Generator: c.Generator,
+		MinCount:  c.MinCount,
+		MaxCount:  c.MaxCount,
+	}
+}

@@ -1,0 +1,230 @@
+// SPDX-License-Identifier: Apache-2.0
+
+package stream
+
+import (
+	"fmt"
+	"strings"
+)
+
+type Status struct {
+	Init                *InitStatus
+	Config              *ConfigStatus
+	TransformationRules *TransformationRulesStatus
+	Source              *SourceStatus
+}
+
+type ConfigStatus struct {
+	Valid  bool
+	Errors []string
+}
+
+type TransformationRulesStatus struct {
+	Valid    bool
+	Errors   []string
+	Warnings []string
+}
+
+type SourceStatus struct {
+	Reachable bool
+	Errors    []string
+}
+
+type InitStatus struct {
+	PgstreamSchema  *SchemaStatus
+	Migrations      []MigrationStatus
+	ReplicationSlot *ReplicationSlotStatus
+}
+
+type MigrationStatus struct {
+	TableName string
+	Version   uint
+	Dirty     bool
+	Errors    []string
+}
+
+type ReplicationSlotStatus struct {
+	Name     string
+	Plugin   string
+	Database string
+	Errors   []string
+}
+
+type SchemaStatus struct {
+	SchemaExists bool
+	Errors       []string
+}
+
+type StatusErrors map[string][]string
+
+func (se StatusErrors) Keys() []string {
+	keys := make([]string, 0, len(se))
+	for k := range se {
+		keys = append(keys, k)
+	}
+	return keys
+}
+
+func (s *Status) GetErrors() StatusErrors {
+	if s == nil {
+		return nil
+	}
+
+	errors := map[string][]string{}
+	if initErrs := s.Init.GetErrors(); len(initErrs) > 0 {
+		errors["init"] = initErrs
+	}
+
+	if s.Source != nil && len(s.Source.Errors) > 0 {
+		errors["source"] = s.Source.Errors
+	}
+
+	if s.Config != nil && len(s.Config.Errors) > 0 {
+		errors["config"] = s.Config.Errors
+	}
+
+	if s.TransformationRules != nil && len(s.TransformationRules.Errors) > 0 {
+		errors["transformation_rules"] = s.TransformationRules.Errors
+	}
+
+	return errors
+}
+
+func (s *Status) PrettyPrint() string {
+	if s == nil {
+		return ""
+	}
+
+	var prettyPrint strings.Builder
+	prettyPrint.WriteString(s.Init.PrettyPrint())
+	prettyPrint.WriteByte('\n')
+	prettyPrint.WriteString(s.Config.PrettyPrint())
+	prettyPrint.WriteByte('\n')
+	prettyPrint.WriteString(s.TransformationRules.PrettyPrint())
+	prettyPrint.WriteByte('\n')
+	prettyPrint.WriteString(s.Source.PrettyPrint())
+
+	return prettyPrint.String()
+}
+
+// GetErrors aggregates all errors from the initialisation status.
+func (is *InitStatus) GetErrors() []string {
+	if is == nil {
+		return nil
+	}
+
+	errors := []string{}
+	if is.PgstreamSchema != nil && len(is.PgstreamSchema.Errors) > 0 {
+		errors = append(errors, is.PgstreamSchema.Errors...)
+	}
+
+	if len(is.Migrations) > 0 {
+		for _, migration := range is.Migrations {
+			if len(migration.Errors) > 0 {
+				errors = append(errors, migration.Errors...)
+			}
+		}
+	}
+
+	if is.ReplicationSlot != nil && len(is.ReplicationSlot.Errors) > 0 {
+		errors = append(errors, is.ReplicationSlot.Errors...)
+	}
+
+	return errors
+}
+
+func (is *InitStatus) PrettyPrint() string {
+	if is == nil {
+		return ""
+	}
+
+	var prettyPrint strings.Builder
+	prettyPrint.WriteString("Initialisation status:\n")
+	if is.PgstreamSchema != nil {
+		fmt.Fprintf(&prettyPrint, " - Pgstream schema exists: %t\n", is.PgstreamSchema.SchemaExists)
+		if len(is.PgstreamSchema.Errors) > 0 {
+			fmt.Fprintf(&prettyPrint, " - Pgstream schema errors: %s\n", is.PgstreamSchema.Errors)
+		}
+	}
+
+	if len(is.Migrations) > 0 {
+		for _, migration := range is.Migrations {
+			fmt.Fprintf(&prettyPrint, " - Migration for table %s:\n", migration.TableName)
+			fmt.Fprintf(&prettyPrint, "\t- Migration current version: %d\n", migration.Version)
+			fmt.Fprintf(&prettyPrint, "\t- Migration status: %s\n", migrationStatus(migration.Dirty))
+			if len(migration.Errors) > 0 {
+				fmt.Fprintf(&prettyPrint, "\t- Migration errors: [%s]\n", strings.Join(migration.Errors, "; "))
+			}
+		}
+	}
+
+	if is.ReplicationSlot != nil {
+		fmt.Fprintf(&prettyPrint, " - Replication slot name: %s\n", is.ReplicationSlot.Name)
+		fmt.Fprintf(&prettyPrint, " - Replication slot plugin: %s\n", is.ReplicationSlot.Plugin)
+		fmt.Fprintf(&prettyPrint, " - Replication slot database: %s\n", is.ReplicationSlot.Database)
+		if len(is.ReplicationSlot.Errors) > 0 {
+			fmt.Fprintf(&prettyPrint, " - Replication slot errors: %s\n", is.ReplicationSlot.Errors)
+		}
+	}
+
+	// trim the last newline character
+	return strings.TrimSuffix(prettyPrint.String(), "\n")
+}
+
+func (ss *SourceStatus) PrettyPrint() string {
+	if ss == nil {
+		return ""
+	}
+
+	var prettyPrint strings.Builder
+	prettyPrint.WriteString("Source status:\n")
+	fmt.Fprintf(&prettyPrint, " - Reachable: %t\n", ss.Reachable)
+	if len(ss.Errors) > 0 {
+		fmt.Fprintf(&prettyPrint, " - Errors: %s\n", ss.Errors)
+	}
+
+	// trim the last newline character
+	return strings.TrimSuffix(prettyPrint.String(), "\n")
+}
+
+func (cs *ConfigStatus) PrettyPrint() string {
+	if cs == nil {
+		return ""
+	}
+
+	var prettyPrint strings.Builder
+	prettyPrint.WriteString("Config status:\n")
+	fmt.Fprintf(&prettyPrint, " - Valid: %t\n", cs.Valid)
+	if len(cs.Errors) > 0 {
+		fmt.Fprintf(&prettyPrint, " - Errors: %s\n", cs.Errors)
+	}
+
+	// trim the last newline character
+	return strings.TrimSuffix(prettyPrint.String(), "\n")
+}
+
+func (trs *TransformationRulesStatus) PrettyPrint() string {
+	if trs == nil {
+		return ""
+	}
+
+	var prettyPrint strings.Builder
+	prettyPrint.WriteString("Transformation rules status:\n")
+	fmt.Fprintf(&prettyPrint, " - Valid: %t\n", trs.Valid)
+	if len(trs.Errors) > 0 {
+		fmt.Fprintf(&prettyPrint, " - Errors: %s\n", trs.Errors)
+	}
+	if len(trs.Warnings) > 0 {
+		fmt.Fprintf(&prettyPrint, " - Warnings: %s\n", trs.Warnings)
+	}
+
+	// trim the last newline character
+	return strings.TrimSuffix(prettyPrint.String(), "\n")
+}
+
+func migrationStatus(dirty bool) string {
+	if !dirty {
+		return "success"
+	}
+	return "failed"
+}

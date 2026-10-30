@@ -1,0 +1,175 @@
+// SPDX-License-Identifier: Apache-2.0
+
+package postgres
+
+import (
+	"context"
+	"fmt"
+
+	"github.com/lib/pq"
+	"github.com/xataio/pgstream/internal/postgres"
+	"github.com/xataio/pgstream/pkg/snapshot"
+	"github.com/xataio/pgstream/pkg/snapshot/store"
+)
+
+type Store struct {
+	conn postgres.Querier
+}
+
+const queryLimit = 1000
+
+func New(ctx context.Context, url string) (*Store, error) {
+	conn, err := postgres.NewConnPool(ctx, url)
+	if err != nil {
+		return nil, err
+	}
+
+	s := &Store{
+		conn: conn,
+	}
+
+	// create snapshots table if it doesn't exist
+	if err := s.createTable(ctx); err != nil {
+		return nil, fmt.Errorf("creating snapshots table: %w", err)
+	}
+
+	return s, nil
+}
+
+func (s *Store) Close() error {
+	return s.conn.Close(context.Background())
+}
+
+func (s *Store) CreateSnapshotRequest(ctx context.Context, req *snapshot.Request) error {
+	query := fmt.Sprintf(`INSERT INTO %s (schema_name, table_names, created_at, updated_at, status, mode)
+	VALUES($1, $2, now(), now(),'requested', $3)`, snapshotsTable())
+	_, err := s.conn.Exec(ctx, query, req.Schema, pq.StringArray(req.Tables), req.GetMode())
+	if err != nil {
+		return fmt.Errorf("error creating snapshot request: %w", err)
+	}
+
+	return nil
+}
+
+func (s *Store) UpdateSnapshotRequest(ctx context.Context, req *snapshot.Request) error {
+	query := fmt.Sprintf(`UPDATE %s SET status = $1, errors = $2, updated_at = now()
+	WHERE schema_name = $3 and table_names = $4 and mode = $5 and status != 'completed'`, snapshotsTable())
+	_, err := s.conn.Exec(ctx, query, req.Status, req.Errors, req.Schema, pq.StringArray(req.Tables), req.GetMode())
+	if err != nil {
+		return fmt.Errorf("error updating snapshot request: %w", err)
+	}
+
+	return nil
+}
+
+func (s *Store) GetSnapshotRequestsByStatus(ctx context.Context, status snapshot.Status) ([]*snapshot.Request, error) {
+	query := fmt.Sprintf(`SELECT schema_name,table_names,status,mode,errors FROM %s
+	WHERE status = $1 ORDER BY req_id ASC LIMIT %d`, snapshotsTable(), queryLimit)
+	rows, err := s.conn.Query(ctx, query, status)
+	if err != nil {
+		return nil, fmt.Errorf("error getting snapshot requests by status: %w", err)
+	}
+	defer rows.Close()
+
+	snapshotRequests := []*snapshot.Request{}
+	for rows.Next() {
+		req := &snapshot.Request{}
+		if err := rows.Scan(&req.Schema, &req.Tables, &req.Status, &req.Mode, &req.Errors); err != nil {
+			return nil, fmt.Errorf("scanning snapshot row: %w", err)
+		}
+
+		snapshotRequests = append(snapshotRequests, req)
+	}
+
+	return snapshotRequests, nil
+}
+
+func (s *Store) GetSnapshotRequestsBySchema(ctx context.Context, schema string) ([]*snapshot.Request, error) {
+	query := fmt.Sprintf(`SELECT schema_name,table_names,status,mode,errors FROM %s
+	WHERE schema_name = $1 ORDER BY req_id ASC LIMIT %d`, snapshotsTable(), queryLimit)
+	rows, err := s.conn.Query(ctx, query, schema)
+	if err != nil {
+		return nil, fmt.Errorf("error getting snapshot requests: %w", err)
+	}
+	defer rows.Close()
+
+	snapshotRequests := []*snapshot.Request{}
+	for rows.Next() {
+		req := &snapshot.Request{}
+		if err := rows.Scan(&req.Schema, &req.Tables, &req.Status, &req.Mode, &req.Errors); err != nil {
+			return nil, fmt.Errorf("scanning snapshot request row: %w", err)
+		}
+
+		snapshotRequests = append(snapshotRequests, req)
+	}
+
+	return snapshotRequests, nil
+}
+
+func (s *Store) createTable(ctx context.Context) error {
+	createSchemaQuery := fmt.Sprintf(`CREATE SCHEMA IF NOT EXISTS %s`, store.SchemaName)
+	_, err := s.conn.Exec(ctx, createSchemaQuery)
+	if err != nil {
+		return fmt.Errorf("error creating pgstream schema for snapshot store: %w", err)
+	}
+
+	createTableQuery := fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s(
+	req_id SERIAL PRIMARY KEY,
+	schema_name TEXT,
+	table_names TEXT[],
+	created_at TIMESTAMP WITH TIME ZONE,
+	updated_at TIMESTAMP WITH TIME ZONE,
+	status TEXT CHECK (status IN ('requested', 'in progress', 'completed')),
+	mode TEXT NOT NULL DEFAULT 'data' CHECK (mode IN ('data', 'schema-only')),
+	errors JSONB )`, snapshotsTable())
+	_, err = s.conn.Exec(ctx, createTableQuery)
+	if err != nil {
+		return fmt.Errorf("error creating snapshots postgres table: %w", err)
+	}
+
+	// upgrade tables created before the mode column existed; all requests
+	// recorded back then were data snapshot requests
+	addModeColumnQuery := fmt.Sprintf(`ALTER TABLE %s
+	ADD COLUMN IF NOT EXISTS mode TEXT NOT NULL DEFAULT 'data' CHECK (mode IN ('data', 'schema-only'))`, snapshotsTable())
+	_, err = s.conn.Exec(ctx, addModeColumnQuery)
+	if err != nil {
+		return fmt.Errorf("error adding mode column to snapshots postgres table: %w", err)
+	}
+
+	// the hashed index below keys on a fixed-size digest of the table names
+	// instead of the raw table_names array, whose index row overflows the btree
+	// tuple size limit for schemas with many tables. postgres requires an index
+	// expression to be IMMUTABLE, so wrap the digest in an immutable helper (a
+	// text[] digest is deterministic).
+	hashFuncQuery := fmt.Sprintf(`CREATE OR REPLACE FUNCTION %s.snapshot_table_names_hash(names TEXT[])
+	RETURNS TEXT LANGUAGE sql IMMUTABLE AS $func$ SELECT md5(names::text) $func$`, store.SchemaName)
+	_, err = s.conn.Exec(ctx, hashFuncQuery)
+	if err != nil {
+		return fmt.Errorf("error creating table names hash function for snapshots postgres table: %w", err)
+	}
+
+	// create the hashed index under a new name, then drop the legacy raw-array
+	// index. both statements are idempotent (IF NOT EXISTS / IF EXISTS), so once
+	// migrated a startup neither creates nor drops anything, and during the
+	// one-time migration the new index is in place before the old one is removed,
+	// so a unique constraint is always enforced (no window without it).
+	uniqueIndexQuery := fmt.Sprintf(`CREATE UNIQUE INDEX IF NOT EXISTS schema_table_status_hash_unique_index
+	ON %s(schema_name,%s.snapshot_table_names_hash(table_names)) WHERE status != 'completed'`, snapshotsTable(), store.SchemaName)
+	_, err = s.conn.Exec(ctx, uniqueIndexQuery)
+	if err != nil {
+		return fmt.Errorf("error creating unique index on snapshots postgres table: %w", err)
+	}
+
+	// the legacy index indexed the raw table_names array
+	dropLegacyIndexQuery := fmt.Sprintf(`DROP INDEX IF EXISTS %s.schema_table_status_unique_index`, store.SchemaName)
+	_, err = s.conn.Exec(ctx, dropLegacyIndexQuery)
+	if err != nil {
+		return fmt.Errorf("error dropping legacy unique index on snapshots postgres table: %w", err)
+	}
+
+	return err
+}
+
+func snapshotsTable() string {
+	return postgres.QuoteQualifiedIdentifier(store.SchemaName, store.TableName)
+}

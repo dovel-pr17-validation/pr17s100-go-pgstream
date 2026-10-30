@@ -1,0 +1,334 @@
+// SPDX-License-Identifier: Apache-2.0
+
+package injector
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"slices"
+	"sort"
+
+	"github.com/xataio/pgstream/internal/json"
+	pglib "github.com/xataio/pgstream/internal/postgres"
+	pginstrumentation "github.com/xataio/pgstream/internal/postgres/instrumentation"
+	synclib "github.com/xataio/pgstream/internal/sync"
+	loglib "github.com/xataio/pgstream/pkg/log"
+	"github.com/xataio/pgstream/pkg/otel"
+	"github.com/xataio/pgstream/pkg/wal"
+	"github.com/xataio/pgstream/pkg/wal/processor"
+)
+
+// Injector is a decorator around a wal processor that injects the wal metadata
+// with the schemalog entry for the relevant schema. This allows following
+// processors to have more information for processing the event effectively.
+type Injector struct {
+	logger               loglib.Logger
+	processor            processor.Processor
+	walToDDLEventAdapter walToDDLEventAdapter
+	querier              pglib.Querier
+	deserializer         func([]byte, any) error
+
+	tableCache *synclib.Map[string, *wal.DDLObject]
+}
+
+type (
+	walToDDLEventAdapter func(*wal.Data) (*wal.DDLEvent, error)
+)
+
+type Config struct {
+	URL string
+}
+
+type Option func(t *Injector)
+
+// New will return an injector processor wrapper that will inject pgstream
+// metadata into the wal data events before passing them over to the processor
+// on input. By default, all schemas are processed and the pgstream identity
+// will be the primary key/not null unique column if present.
+func New(ctx context.Context, cfg *Config, p processor.Processor, opts ...Option) (*Injector, error) {
+	connPool, err := pglib.NewConnPool(ctx, cfg.URL)
+	if err != nil {
+		return nil, err
+	}
+
+	i := &Injector{
+		logger:               loglib.NewNoopLogger(),
+		processor:            p,
+		walToDDLEventAdapter: wal.WalDataToDDLEvent,
+		tableCache:           synclib.NewMap[string, *wal.DDLObject](),
+		querier:              connPool,
+		deserializer:         json.Unmarshal,
+	}
+
+	for _, opt := range opts {
+		opt(i)
+	}
+
+	return i, nil
+}
+
+func WithLogger(l loglib.Logger) Option {
+	return func(in *Injector) {
+		in.logger = loglib.NewLogger(l).WithFields(loglib.Fields{
+			loglib.ModuleField: "wal_injector",
+		})
+	}
+}
+
+func WithInstrumentation(instr *otel.Instrumentation) Option {
+	return func(in *Injector) {
+		var err error
+		in.querier, err = pginstrumentation.NewQuerier(in.querier, instr)
+		if err != nil {
+			// should never happen
+			panic(err)
+		}
+	}
+}
+
+// ProcessWALEvent populates the metadata of the wal event on input, before
+// passing it over to the configured wal processor.
+func (in *Injector) ProcessWALEvent(ctx context.Context, event *wal.Event) error {
+	if event.Data == nil {
+		return in.processor.ProcessWALEvent(ctx, event)
+	}
+
+	data := event.Data
+
+	switch {
+	case data.IsDDLEvent():
+		ddlEvent, err := in.walToDDLEventAdapter(data)
+		if err != nil {
+			return err
+		}
+
+		in.updateTableCache(ddlEvent)
+
+	default:
+		// by default, we inject the metadata and pass on the event. If we fail
+		// to inject metadata, log a DATALOSS severity error and continue
+		// processing the event without it
+		if err := in.inject(ctx, data); err != nil {
+			// for now, do not consider events missing id field to be
+			// data loss, since we don't expect to replicate tables that do not
+			// have these fields
+			if errors.Is(err, processor.ErrIDNotFound) {
+				in.logger.Debug(fmt.Sprintf("ignoring event: %v", err), loglib.Fields{
+					"schema": data.Schema,
+					"table":  data.Table,
+				})
+				// treat the event as a keep alive, so that the event data is
+				// ignored, but the commit position is checkpointed
+				event.Data = nil
+			} else {
+				in.logger.Error(err, "injecting event metadata", loglib.Fields{
+					"severity": "DATALOSS",
+					"schema":   data.Schema,
+					"table":    data.Table,
+				})
+			}
+		}
+	}
+
+	return in.processor.ProcessWALEvent(ctx, event)
+}
+
+func (in *Injector) Name() string {
+	return in.processor.Name()
+}
+
+func (in *Injector) Close() error {
+	var querierErr error
+	if in.querier != nil {
+		querierErr = in.querier.Close(context.Background())
+	}
+	return errors.Join(in.processor.Close(), querierErr)
+}
+
+func (in *Injector) updateTableCache(ddlEvent *wal.DDLEvent) {
+	switch ddlEvent.CommandTag {
+	case "DROP TABLE":
+		tableObjects := ddlEvent.GetTableObjects()
+		// remove from cache any table that was dropped
+		for _, tableObj := range tableObjects {
+			qualifiedTableName := tableObj.Schema + "." + tableObj.GetTable()
+			if _, found := in.tableCache.Get(qualifiedTableName); found {
+				in.tableCache.Delete(qualifiedTableName)
+			}
+		}
+	default:
+		tableObjects := append(ddlEvent.GetTableObjects(), ddlEvent.GetTableColumnObjects()...)
+		in.logger.Debug("updating table cache with table objects", loglib.Fields{
+			"table_objects": tableObjects,
+		})
+		// update the table cache with any new/updated table
+		for _, tableObj := range tableObjects {
+			qualifiedTableName := tableObj.Schema + "." + tableObj.GetTable()
+			in.tableCache.Set(qualifiedTableName, &tableObj)
+		}
+	}
+}
+
+func (in *Injector) inject(ctx context.Context, data *wal.Data) error {
+	tableObject, err := in.getTableObject(ctx, data.Schema, data.Table)
+	if err != nil {
+		return fmt.Errorf("failed to get table object: %w", err)
+	}
+	if tableObject == nil {
+		return processor.ErrTableNotFound
+	}
+
+	if err := in.fillEventMetadata(data, tableObject); err != nil {
+		return fmt.Errorf("failed to fill event metadata from table object: %w", err)
+	}
+
+	if err := in.injectColumnIDs(data, tableObject); err != nil {
+		return fmt.Errorf("failed to inject column ids from table object: %w", err)
+	}
+
+	return nil
+}
+
+// fillEventMetadata will update the event on input with the pgstream ids for
+// the table and the internal identity columns. For tables with a primary key,
+// every primary-key column is included so downstream processors can build valid
+// WHERE/ON CONFLICT clauses for composite primary keys. It will return an error
+// if no identity column can be found.
+func (in *Injector) fillEventMetadata(event *wal.Data, tbl *wal.DDLObject) error {
+	event.Metadata.TablePgstreamID = tbl.PgstreamID
+
+	identityColumns := getIdentityColumns(tbl)
+	if len(identityColumns) == 0 {
+		// the id is required
+		return fmt.Errorf("table [%s]: %w", tbl.Identity, processor.ErrIDNotFound)
+	}
+
+	event.Metadata.InternalColIDs = event.Metadata.InternalColIDs[:0]
+	for _, identityColumn := range identityColumns {
+		event.Metadata.InternalColIDs = append(event.Metadata.InternalColIDs, identityColumn.GetColumnPgstreamID(tbl.PgstreamID))
+	}
+
+	return nil
+}
+
+// injectColumnIDs will replace the existing column ids from the
+// wal data event with the pgstream ids. It will error if the column on input
+// does not exist.
+func (in *Injector) injectColumnIDs(event *wal.Data, tbl *wal.DDLObject) error {
+	var err error
+	for i, col := range event.Columns {
+		schemaCol, found := tbl.GetColumnByName(col.Name)
+		if !found {
+			if in.logger.IsDebugEnabled() {
+				in.logger.Debug("column not found in table object", loglib.Fields{
+					"column": col.Name,
+					"table":  tbl.Identity,
+					"object": tbl,
+				})
+			}
+			err = errors.Join(err, fmt.Errorf("failed to find column %q in table %s: %w", col.Name, tbl.Identity, processor.ErrColumnNotFound))
+			continue
+		}
+		event.Columns[i].ID = schemaCol.GetColumnPgstreamID(tbl.PgstreamID)
+	}
+
+	for i, col := range event.Identity { // should only be filled if event.Type is "D" or "U"
+		schemaCol, found := tbl.GetColumnByName(col.Name)
+		if !found {
+			if in.logger.IsDebugEnabled() {
+				in.logger.Debug("column not found in table object", loglib.Fields{
+					"column": col.Name,
+					"table":  tbl.Identity,
+					"object": tbl,
+				})
+			}
+			err = errors.Join(err, fmt.Errorf("failed to find column %q in table %s: %w", col.Name, tbl.Identity, processor.ErrColumnNotFound))
+			continue
+		}
+		event.Identity[i].ID = schemaCol.GetColumnPgstreamID(tbl.PgstreamID)
+	}
+	return err
+}
+
+const tableObjectQuery = `
+		SELECT jsonb_build_object(
+			'type', 'table',
+			'identity', n.nspname || '.' || c.relname,
+			'schema', n.nspname,
+			'oid', c.oid::text,
+			'pgstream_id', COALESCE(t.id::text, pgstream.create_table_mapping(c.oid)::text)
+		) || pgstream.get_table_metadata(c.oid)
+		FROM pg_class c
+		JOIN pg_namespace n ON c.relnamespace = n.oid
+		LEFT JOIN pgstream.table_ids t ON c.oid = t.oid
+		WHERE n.nspname = $1 AND c.relname = $2 AND c.relkind IN ('r', 'p')
+	`
+
+func (in *Injector) getTableObject(ctx context.Context, schema, table string) (*wal.DDLObject, error) {
+	qualifiedName := schema + "." + table
+	tableObject, found := in.tableCache.Get(qualifiedName)
+	if found {
+		return tableObject, nil
+	}
+
+	var tableObjJSON []byte
+	dest := []any{&tableObjJSON}
+	err := in.querier.QueryRow(ctx, dest, tableObjectQuery, schema, table)
+	if err != nil {
+		if errors.Is(err, pglib.ErrNoRows) {
+			return nil, processor.ErrTableNotFound
+		}
+		return nil, fmt.Errorf("failed to query table metadata: %w", err)
+	}
+
+	// Parse the complete DDLObject JSON
+	var tableObj wal.DDLObject
+	if err := in.deserializer(tableObjJSON, &tableObj); err != nil {
+		return nil, fmt.Errorf("failed to parse table object: %w", err)
+	}
+
+	// Cache it for future use
+	in.tableCache.Set(qualifiedName, &tableObj)
+
+	return &tableObj, nil
+}
+
+func getIdentityColumns(tbl *wal.DDLObject) []wal.DDLColumn {
+	hasPrimaryKeys := len(tbl.PrimaryKeyColumns) > 0
+
+	// Always sort by attnum so identity columns are emitted in table order. This
+	// keeps generated SQL deterministic and preserves composite primary-key order
+	// as it appears in WAL column data.
+	sort.Slice(tbl.Columns, func(i, j int) bool {
+		return tbl.Columns[i].Attnum < tbl.Columns[j].Attnum
+	})
+
+	// If the table has a primary key, every primary-key column is an identity
+	// column. Composite primary keys must include all components; using only the
+	// first column can generate invalid ON CONFLICT clauses and can match the
+	// wrong row for updates/deletes.
+	if hasPrimaryKeys {
+		identityColumns := make([]wal.DDLColumn, 0, len(tbl.PrimaryKeyColumns))
+		for _, col := range tbl.Columns {
+			if slices.Contains(tbl.PrimaryKeyColumns, col.Name) {
+				identityColumns = append(identityColumns, col)
+			}
+		}
+		if len(identityColumns) == 0 {
+			return nil
+		}
+		return identityColumns
+	}
+
+	// If there's no primary key defined for the table, use the first not-null
+	// unique column. A single unique column is enough for row identity; composite
+	// unique constraints are not represented in DDLColumn.Unique today.
+	for _, col := range tbl.Columns {
+		if col.Unique && !col.Nullable {
+			return []wal.DDLColumn{col}
+		}
+	}
+
+	return nil
+}

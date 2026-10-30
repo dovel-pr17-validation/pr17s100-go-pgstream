@@ -1,0 +1,223 @@
+version: "3.8"
+name: pgstream
+services:
+  db1-pg14:
+    build: postgres-14
+    restart: always
+    environment:
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres
+    ports:
+      - "5432:5432"
+    volumes:
+      - data-pg14:/var/lib/postgresql/data
+      - ./postgres-14/postgresql.conf:/etc/postgresql.conf
+    command: -c config_file=/etc/postgresql.conf
+    profiles: ["pg2pg14"]
+    networks:
+      - pgstream-net
+
+  db2-pg14:
+    build: postgres-14
+    restart: always
+    environment:
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres
+    ports:
+      - "7654:5432"
+    volumes:
+      - ./postgres-14/postgresql.conf:/etc/postgresql.conf
+    command: -c config_file=/etc/postgresql.conf
+    profiles: ["pg2pg14"]
+    networks:
+      - pgstream-net
+
+  db1-pg15:
+    build: postgres-15
+    restart: always
+    environment:
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres
+    ports:
+      - "5432:5432"
+    volumes:
+      - data-pg15:/var/lib/postgresql/data
+      - ./postgres-15/postgresql.conf:/etc/postgresql.conf
+    command: -c config_file=/etc/postgresql.conf
+    profiles: ["pg2pg15"]
+    networks:
+      - pgstream-net
+
+  db2-pg15:
+    build: postgres-15
+    restart: always
+    environment:
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres
+    ports:
+      - "7654:5432"
+    volumes:
+      - ./postgres-15/postgresql.conf:/etc/postgresql.conf
+    command: -c config_file=/etc/postgresql.conf
+    profiles: ["pg2pg15"]
+    networks:
+      - pgstream-net
+
+  db1-pg16:
+    build: postgres-16
+    restart: always
+    environment:
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres
+    ports:
+      - "5432:5432"
+    volumes:
+      - data-pg16:/var/lib/postgresql/data
+      - ./postgres-16/postgresql.conf:/etc/postgresql.conf
+    command: -c config_file=/etc/postgresql.conf
+    profiles: ["pg2pg16"]
+    networks:
+      - pgstream-net
+
+  db2-pg16:
+    build: postgres-16
+    restart: always
+    environment:
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres
+    ports:
+      - "7654:5432"
+    volumes:
+      - ./postgres-16/postgresql.conf:/etc/postgresql.conf
+    command: -c config_file=/etc/postgresql.conf
+    profiles: ["pg2pg16"]
+    networks:
+      - pgstream-net
+
+  db1-pg17:
+    build: postgres-17
+    restart: always
+    environment:
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres
+    ports:
+      - "5432:5432"
+    volumes:
+      - data-pg17:/var/lib/postgresql/data
+      - ./postgres-17/postgresql.conf:/etc/postgresql.conf
+    command: -c config_file=/etc/postgresql.conf
+    profiles: ["pg2pg17"]
+    networks:
+      - pgstream-net
+
+  db2-pg17:
+    build: postgres-17
+    restart: always
+    environment:
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres
+    ports:
+      - "7654:5432"
+    volumes:
+      - ./postgres-17/postgresql.conf:/etc/postgresql.conf
+    command: -c config_file=/etc/postgresql.conf
+    profiles: ["pg2pg17"]
+    networks:
+      - pgstream-net
+
+  db1-pg18:
+    build: postgres-18
+    restart: always
+    environment:
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres
+    ports:
+      - "5432:5432"
+    volumes:
+      - data-pg18:/var/lib/postgresql
+      - ./postgres-18/postgresql.conf:/etc/postgresql.conf
+    command: -c config_file=/etc/postgresql.conf
+    profiles: ["pg2os", "pg2webhook", "pg2pg"]
+    networks:
+      - pgstream-net
+
+  db2-pg18:
+    build: postgres-18
+    restart: always
+    environment:
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres
+    ports:
+      - "7654:5432"
+    volumes:
+      - ./postgres-18/postgresql.conf:/etc/postgresql.conf
+    command: -c config_file=/etc/postgresql.conf
+    profiles: ["pg2pg"]
+    networks:
+      - pgstream-net
+
+  kafka:
+    image: "apache/kafka:latest"
+    ports:
+      - "9092:9092"
+      - "9094:9094"
+    environment:
+      - KAFKA_NODE_ID=0
+      - KAFKA_PROCESS_ROLES=broker,controller
+      - KAFKA_LISTENERS=PLAINTEXT://:9092,CONTROLLER://:9093,EXTERNAL://:9094
+      - KAFKA_ADVERTISED_LISTENERS=PLAINTEXT://localhost:9092,EXTERNAL://localhost:9094
+      - KAFKA_CONTROLLER_LISTENER_NAMES=CONTROLLER
+      - KAFKA_LISTENER_SECURITY_PROTOCOL_MAP=CONTROLLER:PLAINTEXT,EXTERNAL:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      - KAFKA_CONTROLLER_QUORUM_VOTERS=0@kafka:9093
+      - KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR=1
+      - KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR=1
+      - KAFKA_TRANSACTION_STATE_LOG_MIN_ISR=1
+      - KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS=0
+    profiles: ["kafka"]
+    networks:
+      - pgstream-net
+
+  opensearch:
+    image: "opensearchproject/opensearch:3.8.0"
+    environment:
+      - cluster.name=opensearch-cluster-pgstream
+      - node.name=opensearch-node-pgstream
+      - discovery.type=single-node
+      - bootstrap.memory_lock=true # along with the memlock settings below, disables swapping
+      - "OPENSEARCH_JAVA_OPTS=-Xms512m -Xmx512m"
+      - "OPENSEARCH_INITIAL_ADMIN_PASSWORD=StrongAdmin123!"
+      - "plugins.security.ssl.http.enabled=false"
+    ports:
+      - 9200:9200 # REST API
+      - 9600:9600 # Performance Analyzer
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+    profiles: ["pg2os"]
+    networks:
+      - pgstream-net
+
+  opensearch-dashboards:
+    image: "opensearchproject/opensearch-dashboards:3.8.0"
+    ports: ["5601:5601"]
+    environment: ["OPENSEARCH_HOSTS=http://opensearch:9200"] # 9201 to access externally, 9200 internally
+    profiles: ["pg2os"]
+    networks:
+      - pgstream-net
+
+volumes:
+  data-pg14:
+    driver: local
+  data-pg15:
+    driver: local
+  data-pg16:
+    driver: local
+  data-pg17:
+    driver: local
+  data-pg18:
+    driver: local
+
+networks:
+  pgstream-net:
+    name: pgstream-net

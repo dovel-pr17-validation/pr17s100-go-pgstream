@@ -1,0 +1,240 @@
+// SPDX-License-Identifier: Apache-2.0
+
+package integration
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"os"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/require"
+	pglib "github.com/xataio/pgstream/internal/postgres"
+	"github.com/xataio/pgstream/internal/searchstore"
+	"github.com/xataio/pgstream/internal/searchstore/elasticsearch"
+	"github.com/xataio/pgstream/internal/searchstore/opensearch"
+	"github.com/xataio/pgstream/pkg/stream"
+	"github.com/xataio/pgstream/pkg/wal/processor/search/store"
+)
+
+func Test_PostgresToSearch(t *testing.T) {
+	if os.Getenv("PGSTREAM_INTEGRATION_TESTS") == "" {
+		t.Skip("skipping integration test...")
+	}
+
+	run := func(t *testing.T, cfg *stream.Config, client searchstore.Client, testSchema string) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		// create a dedicated schema for the opensearch tests to ensure there's no
+		// interference between the other integration tests by having a separate index.
+		execQuery(t, ctx, fmt.Sprintf("create schema %s", testSchema))
+
+		runStream(t, ctx, cfg)
+
+		var testTablePgstreamID string
+		testTable := "test"
+		testIndex := fmt.Sprintf("%s-1", testSchema)
+
+		tests := []struct {
+			name  string
+			query string
+
+			validation func() bool
+		}{
+			{
+				name:  "schema event",
+				query: fmt.Sprintf("create table %s.%s(id serial primary key, name text)", testSchema, testTable),
+
+				validation: func() bool {
+					testTablePgstreamID = getTablePgstreamID(t, ctx, testSchema, testTable)
+					if testTablePgstreamID == "" {
+						return false
+					}
+
+					idField := fmt.Sprintf("%s-1", testTablePgstreamID)
+					nameField := fmt.Sprintf("%s-2", testTablePgstreamID)
+
+					// the index exists before the indexer has finished applying
+					// the schema event's field mappings, so keep waiting until
+					// every field is there. Asserting on a mapping that is
+					// still being built fails the test outright, because these
+					// requires run inside the retry loop.
+					mapping := getIndexMapping(t, ctx, client, testIndex)
+					for _, field := range []string{"_table", idField, nameField, testTable} {
+						if _, found := mapping[field]; !found {
+							return false
+						}
+					}
+
+					require.Equal(t, map[string]any{"type": "keyword"}, mapping["_table"])
+					require.Equal(t, map[string]any{"type": "long"}, mapping[idField])
+					require.Equal(t, map[string]any{
+						"fields": map[string]any{
+							"text": map[string]any{"type": "text"},
+						},
+						"ignore_above": float64(32766),
+						"type":         "keyword",
+					}, mapping[nameField])
+					require.Equal(t, map[string]any{
+						"properties": map[string]any{
+							"id": map[string]any{
+								"type": "alias",
+								"path": idField,
+							},
+							"name": map[string]any{
+								"type": "alias",
+								"path": nameField,
+							},
+						},
+					}, mapping[testTable])
+					return true
+				},
+			},
+			{
+				name:  "data event",
+				query: fmt.Sprintf("insert into %s.%s(name) values('a')", testSchema, testTable),
+
+				validation: func() bool {
+					resp, err := searchTable(ctx, client, testIndex, testTablePgstreamID)
+					if err != nil || resp.Hits.Total.Value != 1 {
+						return false
+					}
+					hit := resp.Hits.Hits[0]
+					t.Log(hit)
+					require.Equal(t, fmt.Sprintf("%s_1", testTablePgstreamID), hit.ID)
+					require.Equal(t, "a", hit.Source[fmt.Sprintf("%s-2", testTablePgstreamID)])
+					return true
+				},
+			},
+		}
+
+		for _, tc := range tests {
+			t.Run(tc.name, func(t *testing.T) {
+				execQuery(t, ctx, tc.query)
+
+				timer := time.NewTimer(20 * time.Second)
+				defer timer.Stop()
+				ticker := time.NewTicker(time.Second)
+				defer ticker.Stop()
+
+				for {
+					select {
+					case <-timer.C:
+						cancel()
+						t.Error("timeout waiting for opensearch data")
+						return
+					case <-ticker.C:
+						exists, err := client.IndexExists(ctx, testIndex)
+						if err == nil && exists && tc.validation() {
+							return
+						}
+					}
+				}
+			})
+		}
+	}
+
+	t.Run("postgres to opensearch", func(t *testing.T) {
+		opensearchContainer.require(t)
+
+		cfg := &stream.Config{
+			Listener: testPostgresListenerCfg(t),
+			Processor: testSearchProcessorCfg(store.Config{
+				OpenSearchURL: opensearchURL,
+			}),
+		}
+
+		client, err := opensearch.NewClient(opensearchURL)
+		require.NoError(t, err)
+
+		run(t, cfg, client, "pg2os_integration_test")
+	})
+
+	t.Run("postgres to elasticsearch", func(t *testing.T) {
+		elasticsearchContainer.require(t)
+
+		cfg := &stream.Config{
+			Listener: testPostgresListenerCfg(t),
+			Processor: testSearchProcessorCfg(store.Config{
+				ElasticsearchURL: elasticsearchURL,
+			}),
+		}
+
+		client, err := elasticsearch.NewClient(elasticsearchURL)
+		require.NoError(t, err)
+
+		run(t, cfg, client, "pg2es_integration_test")
+	})
+}
+
+func searchTable(ctx context.Context, client searchstore.Client, index, tableID string) (*searchstore.SearchResponse, error) {
+	query := searchstore.QueryBody{
+		Query: &searchstore.Query{
+			Bool: &searchstore.BoolFilter{
+				Filter: []searchstore.Condition{
+					{
+						Term: map[string]any{
+							"_table": tableID,
+						},
+					},
+				},
+			},
+		},
+	}
+
+	return searchQuery(ctx, client, index, query, nil)
+}
+
+func searchQuery(ctx context.Context, client searchstore.Client, index string, query searchstore.QueryBody, sort *string) (*searchstore.SearchResponse, error) {
+	queryBytes, err := json.Marshal(&query)
+	if err != nil {
+		return nil, err
+	}
+
+	resp, err := client.Search(ctx, &searchstore.SearchRequest{
+		Index: searchstore.Ptr(index),
+		Query: bytes.NewBuffer(queryBytes),
+		Sort:  sort,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	return resp, nil
+}
+
+func getIndexMapping(t *testing.T, ctx context.Context, client searchstore.Client, index string) map[string]any {
+	mapping, err := client.GetIndexMappings(ctx, index)
+	require.NoError(t, err)
+
+	return mapping.Properties
+}
+
+const pgstreamidQuery = `SELECT t.id
+FROM pgstream.table_ids t
+JOIN pg_class c ON t.oid = c.oid
+JOIN pg_namespace n ON c.relnamespace = n.oid
+WHERE n.nspname = $1
+  AND c.relname = $2`
+
+func getTablePgstreamID(t *testing.T, ctx context.Context, schemaName, tableName string) string {
+	conn, err := pglib.NewConn(ctx, pgurl)
+	require.NoError(t, err)
+	defer conn.Close(ctx)
+
+	pgstreamID := ""
+	err = conn.QueryRow(ctx, []any{&pgstreamID}, pgstreamidQuery, schemaName, tableName)
+	if err != nil {
+		errRelationDoesNotExist := &pglib.ErrRelationDoesNotExist{}
+		if errors.Is(err, pglib.ErrNoRows) || errors.As(err, &errRelationDoesNotExist) {
+			return ""
+		}
+	}
+	require.NoError(t, err)
+	return pgstreamID
+}

@@ -1,0 +1,1181 @@
+// SPDX-License-Identifier: Apache-2.0
+
+package postgres
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/require"
+	pglib "github.com/xataio/pgstream/internal/postgres"
+	pgmocks "github.com/xataio/pgstream/internal/postgres/mocks"
+	loglib "github.com/xataio/pgstream/pkg/log"
+	"github.com/xataio/pgstream/pkg/wal"
+	"github.com/xataio/pgstream/pkg/wal/checkpointer"
+	"github.com/xataio/pgstream/pkg/wal/processor"
+	"github.com/xataio/pgstream/pkg/wal/processor/batch"
+	batchmocks "github.com/xataio/pgstream/pkg/wal/processor/batch/mocks"
+)
+
+var (
+	testSchema = "test_schema"
+	testTable  = "test_table"
+
+	testLSNStr         = "1/CF54A048"
+	testCommitPosition = wal.CommitPosition(testLSNStr)
+
+	errTest = errors.New("oh noes")
+)
+
+func TestBatchWriter_ProcessWALEvent(t *testing.T) {
+	t.Parallel()
+
+	testWalEvent := &wal.Event{
+		Data: &wal.Data{
+			Action: "I",
+			LSN:    testLSNStr,
+			Schema: testSchema,
+			Table:  testTable,
+		},
+		CommitPosition: testCommitPosition,
+	}
+
+	testMessage := &walMessage{
+		data: testWalEvent.Data,
+		schemaInfo: schemaInfo{
+			generatedColumns: map[string]struct{}{},
+			sequenceColumns:  map[string]string{},
+		},
+	}
+
+	tests := []struct {
+		name        string
+		walEvent    *wal.Event
+		batchSender *batchmocks.BatchSender[*walMessage]
+		adapter     walAdapter
+
+		wantMsgs []*batch.WALMessage[*walMessage]
+		wantErr  error
+	}{
+		{
+			name:        "ok",
+			walEvent:    testWalEvent,
+			batchSender: batchmocks.NewBatchSender[*walMessage](),
+			adapter: &mockAdapter{
+				walEventToMessageFn: func(e *wal.Event) (*walMessage, error) {
+					require.Equal(t, e, testWalEvent)
+					return testMessage, nil
+				},
+			},
+
+			wantMsgs: []*batch.WALMessage[*walMessage]{
+				batch.NewWALMessage(testMessage, testCommitPosition),
+			},
+			wantErr: nil,
+		},
+		{
+			name:        "error - event to message",
+			walEvent:    testWalEvent,
+			batchSender: batchmocks.NewBatchSender[*walMessage](),
+			adapter: &mockAdapter{
+				walEventToMessageFn: func(e *wal.Event) (*walMessage, error) {
+					return nil, errTest
+				},
+			},
+
+			wantMsgs: []*batch.WALMessage[*walMessage]{},
+			wantErr:  errTest,
+		},
+		{
+			name:     "error - adding to batch",
+			walEvent: testWalEvent,
+			batchSender: func() *batchmocks.BatchSender[*walMessage] {
+				s := batchmocks.NewBatchSender[*walMessage]()
+				s.SendMessageFn = func(ctx context.Context, w *batch.WALMessage[*walMessage]) error { return errTest }
+				return s
+			}(),
+			adapter: &mockAdapter{
+				walEventToMessageFn: func(e *wal.Event) (*walMessage, error) {
+					require.Equal(t, e, testWalEvent)
+					return testMessage, nil
+				},
+			},
+
+			wantMsgs: []*batch.WALMessage[*walMessage]{},
+			wantErr:  errTest,
+		},
+		{
+			name:        "error - panic recovery",
+			walEvent:    testWalEvent,
+			batchSender: batchmocks.NewBatchSender[*walMessage](),
+			adapter: &mockAdapter{
+				walEventToMessageFn: func(e *wal.Event) (*walMessage, error) {
+					panic(errTest)
+				},
+			},
+
+			wantMsgs: []*batch.WALMessage[*walMessage]{},
+			wantErr:  processor.ErrPanic,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			writer := &BatchWriter{
+				Writer: &Writer{
+					logger:  loglib.NewNoopLogger(),
+					adapter: tc.adapter,
+				},
+				batchSender: tc.batchSender,
+			}
+
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+
+			go func() {
+				defer tc.batchSender.Close()
+				err := writer.ProcessWALEvent(ctx, tc.walEvent)
+				if !errors.Is(err, tc.wantErr) {
+					require.Equal(t, err.Error(), tc.wantErr.Error())
+				}
+			}()
+
+			msgs := tc.batchSender.GetWALMessages()
+			require.Equal(t, tc.wantMsgs, msgs)
+		})
+	}
+}
+
+func TestBatchWriter_sendBatch(t *testing.T) {
+	t.Parallel()
+
+	newDMLMsg := func(action string, schema, table string, identity []wal.Column) *walMessage {
+		return &walMessage{
+			data: &wal.Data{
+				Action:   action,
+				Schema:   schema,
+				Table:    table,
+				Identity: identity,
+			},
+		}
+	}
+
+	deleteMsg := func(id any) *walMessage {
+		return newDMLMsg("D", testSchema, testTable, []wal.Column{
+			{Name: "id", Type: "bigint", Value: id},
+		})
+	}
+
+	rowColumns := func(id any, name string) []wal.Column {
+		return []wal.Column{
+			{Name: "id", Type: "bigint", Value: id},
+			{Name: "name", Type: "text", Value: name},
+		}
+	}
+
+	insertMsg := func(id any, name string) *walMessage {
+		return &walMessage{data: &wal.Data{
+			Action:  "I",
+			Schema:  testSchema,
+			Table:   testTable,
+			Columns: rowColumns(id, name),
+		}}
+	}
+
+	updateMsg := func(id any, name string) *walMessage {
+		return &walMessage{data: &wal.Data{
+			Action:   "U",
+			Schema:   testSchema,
+			Table:    testTable,
+			Columns:  rowColumns(id, name),
+			Identity: []wal.Column{{Name: "id", Type: "bigint", Value: id}},
+		}}
+	}
+
+	// recordingConn captures the statements a case executes in order, so a case
+	// can assert on how the batch was split rather than only on the error.
+	recordingConn := func(executed *[]string) *pgmocks.Querier {
+		return &pgmocks.Querier{
+			ExecInTxFn: func(ctx context.Context, f func(tx pglib.Tx) error) error {
+				mockTx := pgmocks.Tx{
+					ExecFn: func(ctx context.Context, _ uint, sql string, args ...any) (pglib.CommandTag, error) {
+						*executed = append(*executed, sql)
+						return pglib.CommandTag{}, nil
+					},
+				}
+				return f(&mockTx)
+			},
+			CloseFn: func(ctx context.Context) error { return nil },
+		}
+	}
+
+	var runBoundarySQL, updateRunSQL []string
+
+	tests := []struct {
+		name         string
+		pgconn       *pgmocks.Querier
+		adapter      walAdapter
+		dmlAdapter   *dmlAdapter
+		batch        *batch.Batch[*walMessage]
+		checkpointer checkpointer.Checkpoint
+
+		assert  func(t *testing.T)
+		wantErr error
+	}{
+		{
+			name: "ok - single insert message",
+			pgconn: &pgmocks.Querier{
+				ExecInTxFn: func(ctx context.Context, f func(tx pglib.Tx) error) error {
+					mockTx := pgmocks.Tx{
+						ExecFn: func(ctx context.Context, _ uint, sql string, args ...any) (pglib.CommandTag, error) {
+							return pglib.CommandTag{}, nil
+						},
+					}
+					return f(&mockTx)
+				},
+				CloseFn: func(ctx context.Context) error { return nil },
+			},
+			adapter:    &mockAdapter{},
+			dmlAdapter: mustNewDMLAdapter(t),
+			batch: batch.NewBatch([]*walMessage{
+				{
+					data: &wal.Data{
+						Action: "I",
+						Schema: testSchema,
+						Table:  testTable,
+						Columns: []wal.Column{
+							{Name: "id", Type: "bigint", Value: float64(1)},
+							{Name: "name", Type: "text", Value: "alice"},
+						},
+					},
+				},
+			}, []wal.CommitPosition{testCommitPosition}),
+
+			wantErr: nil,
+		},
+		{
+			name: "ok - coalesced deletes",
+			pgconn: &pgmocks.Querier{
+				ExecInTxFn: func(ctx context.Context, f func(tx pglib.Tx) error) error {
+					mockTx := pgmocks.Tx{
+						ExecFn: func(ctx context.Context, _ uint, sql string, args ...any) (pglib.CommandTag, error) {
+							require.True(t, strings.Contains(sql, "ANY"), "expected bulk delete with ANY, got: %s", sql)
+							return pglib.CommandTag{}, nil
+						},
+					}
+					return f(&mockTx)
+				},
+				CloseFn: func(ctx context.Context) error { return nil },
+			},
+			adapter:    &mockAdapter{},
+			dmlAdapter: mustNewDMLAdapter(t),
+			batch: batch.NewBatch([]*walMessage{
+				deleteMsg(float64(1)),
+				deleteMsg(float64(2)),
+				deleteMsg(float64(3)),
+			}, []wal.CommitPosition{testCommitPosition}),
+
+			wantErr: nil,
+		},
+		{
+			name: "ok - DDL flushes pending DML",
+			pgconn: &pgmocks.Querier{
+				ExecInTxFn: func(ctx context.Context, f func(tx pglib.Tx) error) error {
+					// Each transaction is separate, so statements are matched by content.
+					mockTx := pgmocks.Tx{
+						ExecFn: func(ctx context.Context, i uint, sql string, args ...any) (pglib.CommandTag, error) {
+							switch {
+							case sql == prependSearchPath:
+								require.Equal(t, uint(1), i, "search path must be set first")
+								require.Equal(t, []any{`"test_schema"`}, args)
+							case strings.HasPrefix(sql, "ALTER TABLE"):
+								require.Equal(t, "ALTER TABLE test_schema.test_table ADD COLUMN x text", sql)
+								require.Equal(t, uint(2), i, "DDL must run after the search path is set")
+							}
+							return pglib.CommandTag{}, nil
+						},
+					}
+					return f(&mockTx)
+				},
+				ExecFn: func(ctx context.Context, _ uint, sql string, args ...any) (pglib.CommandTag, error) {
+					t.Errorf("DDL must be replayed with the upstream search path, got bare exec of %q", sql)
+					return pglib.CommandTag{}, errTest
+				},
+				CloseFn: func(ctx context.Context) error { return nil },
+			},
+			adapter: &mockAdapter{
+				walEventToQueriesFn: func(e *wal.Event) ([]*query, error) {
+					return []*query{{
+						schema: testSchema,
+						table:  testTable,
+						sql:    "ALTER TABLE test_schema.test_table ADD COLUMN x text",
+						isDDL:  true,
+					}}, nil
+				},
+			},
+			dmlAdapter: mustNewDMLAdapter(t),
+			batch: batch.NewBatch([]*walMessage{
+				deleteMsg(float64(1)),
+				{data: &wal.Data{Action: "M", Prefix: "pgstream.ddl", Schema: testSchema, Table: testTable}, isDDL: true},
+			}, []wal.CommitPosition{testCommitPosition}),
+
+			wantErr: nil,
+		},
+		{
+			// a run is the unit of coalescing, so the boundary between two of
+			// them is what keeps a delete from being folded into the inserts
+			// around it. Without the flush on action change the two inserts
+			// would merge across the delete and the rows would land in the
+			// wrong order.
+			name:       "ok - a change of action flushes the pending run",
+			pgconn:     recordingConn(&runBoundarySQL),
+			adapter:    &mockAdapter{},
+			dmlAdapter: mustNewDMLAdapter(t),
+			batch: batch.NewBatch([]*walMessage{
+				insertMsg(float64(1), "a"),
+				insertMsg(float64(2), "b"),
+				deleteMsg(float64(3)),
+				insertMsg(float64(4), "d"),
+			}, []wal.CommitPosition{testCommitPosition}),
+
+			assert: func(t *testing.T) {
+				require.Len(t, runBoundarySQL, 3, "expected three runs: insert, delete, insert")
+
+				require.Contains(t, runBoundarySQL[0], "INSERT INTO")
+				// two rows of two columns coalesced into one statement
+				require.Contains(t, runBoundarySQL[0], "$4")
+				require.NotContains(t, runBoundarySQL[0], "$5")
+
+				require.Contains(t, runBoundarySQL[1], "DELETE FROM")
+				require.Contains(t, runBoundarySQL[1], "ANY")
+
+				// the trailing insert is its own run, not appended to the first
+				require.Contains(t, runBoundarySQL[2], "INSERT INTO")
+				require.Contains(t, runBoundarySQL[2], "$2")
+				require.NotContains(t, runBoundarySQL[2], "$3")
+			},
+			wantErr: nil,
+		},
+		{
+			// updates take the default branch of buildCoalescedQueries: they
+			// are emitted one statement per event rather than coalesced
+			name:       "ok - updates are not coalesced",
+			pgconn:     recordingConn(&updateRunSQL),
+			adapter:    &mockAdapter{},
+			dmlAdapter: mustNewDMLAdapter(t),
+			batch: batch.NewBatch([]*walMessage{
+				updateMsg(float64(1), "a"),
+				updateMsg(float64(2), "b"),
+			}, []wal.CommitPosition{testCommitPosition}),
+
+			assert: func(t *testing.T) {
+				require.Len(t, updateRunSQL, 2, "each update is its own statement")
+				for _, sql := range updateRunSQL {
+					require.Contains(t, sql, "UPDATE")
+					require.Contains(t, sql, "WHERE")
+				}
+			},
+			wantErr: nil,
+		},
+		{
+			name: "ok - unqualified DDL replayed on the upstream schema",
+			pgconn: &pgmocks.Querier{
+				ExecInTxFn: func(ctx context.Context, f func(tx pglib.Tx) error) error {
+					mockTx := pgmocks.Tx{
+						ExecFn: func(ctx context.Context, i uint, sql string, args ...any) (pglib.CommandTag, error) {
+							switch i {
+							case 1:
+								require.Equal(t, prependSearchPath, sql)
+								require.Equal(t, []any{`"test_schema"`}, args)
+							case 2:
+								require.Equal(t, "create table test (id int)", sql)
+							default:
+								t.Errorf("unexpected query in DDL transaction: %q", sql)
+							}
+							return pglib.CommandTag{}, nil
+						},
+					}
+					return f(&mockTx)
+				},
+				ExecFn: func(ctx context.Context, _ uint, sql string, args ...any) (pglib.CommandTag, error) {
+					t.Errorf("DDL must be replayed with the upstream search path, got bare exec of %q", sql)
+					return pglib.CommandTag{}, errTest
+				},
+				CloseFn: func(ctx context.Context) error { return nil },
+			},
+			adapter: &mockAdapter{
+				walEventToQueriesFn: func(e *wal.Event) ([]*query, error) {
+					return []*query{{
+						schema: testSchema,
+						table:  testTable,
+						sql:    "create table test (id int)",
+						isDDL:  true,
+					}}, nil
+				},
+			},
+			dmlAdapter: mustNewDMLAdapter(t),
+			batch: batch.NewBatch([]*walMessage{
+				{data: &wal.Data{Action: "M", Prefix: "pgstream.ddl", Schema: testSchema, Table: testTable}, isDDL: true},
+			}, []wal.CommitPosition{testCommitPosition}),
+
+			wantErr: nil,
+		},
+		{
+			name: "ok - concurrent DDL replayed outside a transaction",
+			pgconn: &pgmocks.Querier{
+				ExecInTxFn: func(ctx context.Context, f func(tx pglib.Tx) error) error {
+					t.Error("concurrent DDL must not run inside a transaction")
+					return errTest
+				},
+				ExecFn: func(ctx context.Context, _ uint, sql string, args ...any) (pglib.CommandTag, error) {
+					require.Equal(t, "CREATE INDEX CONCURRENTLY test_idx ON test (id)", sql)
+					return pglib.CommandTag{}, nil
+				},
+				CloseFn: func(ctx context.Context) error { return nil },
+			},
+			adapter: &mockAdapter{
+				walEventToQueriesFn: func(e *wal.Event) ([]*query, error) {
+					return []*query{{
+						schema: testSchema,
+						table:  testTable,
+						sql:    "CREATE INDEX CONCURRENTLY test_idx ON test (id)",
+						isDDL:  true,
+					}}, nil
+				},
+			},
+			dmlAdapter: mustNewDMLAdapter(t),
+			batch: batch.NewBatch([]*walMessage{
+				{data: &wal.Data{Action: "M", Prefix: "pgstream.ddl", Schema: testSchema, Table: testTable}, isDDL: true},
+			}, []wal.CommitPosition{testCommitPosition}),
+
+			wantErr: nil,
+		},
+		{
+			name: "ok - DDL rejected inside a transaction is replayed outside one",
+			pgconn: &pgmocks.Querier{
+				ExecInTxFn: func(ctx context.Context, f func(tx pglib.Tx) error) error {
+					mockTx := pgmocks.Tx{
+						ExecFn: func(ctx context.Context, i uint, sql string, args ...any) (pglib.CommandTag, error) {
+							if i == 1 {
+								return pglib.CommandTag{}, nil
+							}
+							return pglib.CommandTag{}, &pglib.ErrActiveSQLTransaction{
+								Details: "VACUUM cannot run inside a transaction block",
+							}
+						},
+					}
+					return f(&mockTx)
+				},
+				ExecFn: func(ctx context.Context, _ uint, sql string, args ...any) (pglib.CommandTag, error) {
+					require.Equal(t, "VACUUM FULL test", sql)
+					return pglib.CommandTag{}, nil
+				},
+				CloseFn: func(ctx context.Context) error { return nil },
+			},
+			adapter: &mockAdapter{
+				walEventToQueriesFn: func(e *wal.Event) ([]*query, error) {
+					return []*query{{
+						schema: testSchema,
+						table:  testTable,
+						sql:    "VACUUM FULL test",
+						isDDL:  true,
+					}}, nil
+				},
+			},
+			dmlAdapter: mustNewDMLAdapter(t),
+			batch: batch.NewBatch([]*walMessage{
+				{data: &wal.Data{Action: "M", Prefix: "pgstream.ddl", Schema: testSchema, Table: testTable}, isDDL: true},
+			}, []wal.CommitPosition{testCommitPosition}),
+
+			wantErr: nil,
+		},
+		{
+			name: "ok - DDL without schema replayed as is",
+			pgconn: &pgmocks.Querier{
+				ExecInTxFn: func(ctx context.Context, f func(tx pglib.Tx) error) error {
+					t.Error("DDL without a schema must not run inside a transaction")
+					return errTest
+				},
+				ExecFn: func(ctx context.Context, _ uint, sql string, args ...any) (pglib.CommandTag, error) {
+					require.Equal(t, "CREATE SCHEMA schema1", sql)
+					return pglib.CommandTag{}, nil
+				},
+				CloseFn: func(ctx context.Context) error { return nil },
+			},
+			adapter: &mockAdapter{
+				walEventToQueriesFn: func(e *wal.Event) ([]*query, error) {
+					return []*query{{
+						sql:   "CREATE SCHEMA schema1",
+						isDDL: true,
+					}}, nil
+				},
+			},
+			dmlAdapter: mustNewDMLAdapter(t),
+			batch: batch.NewBatch([]*walMessage{
+				{data: &wal.Data{Action: "M", Prefix: "pgstream.ddl", Schema: testSchema, Table: testTable}, isDDL: true},
+			}, []wal.CommitPosition{testCommitPosition}),
+
+			wantErr: nil,
+		},
+		{
+			name: "error - executing query",
+			pgconn: &pgmocks.Querier{
+				ExecInTxFn: func(ctx context.Context, f func(tx pglib.Tx) error) error {
+					mockTx := pgmocks.Tx{
+						ExecFn: func(ctx context.Context, _ uint, sql string, args ...any) (pglib.CommandTag, error) {
+							return pglib.CommandTag{}, errTest
+						},
+					}
+					return f(&mockTx)
+				},
+				CloseFn: func(ctx context.Context) error { return nil },
+			},
+			adapter:    &mockAdapter{},
+			dmlAdapter: mustNewDMLAdapter(t),
+			batch: batch.NewBatch([]*walMessage{
+				deleteMsg(float64(1)),
+			}, []wal.CommitPosition{testCommitPosition}),
+
+			wantErr: errTest,
+		},
+		{
+			name: "error - checkpointing",
+			pgconn: &pgmocks.Querier{
+				ExecInTxFn: func(ctx context.Context, f func(tx pglib.Tx) error) error {
+					mockTx := pgmocks.Tx{
+						ExecFn: func(ctx context.Context, _ uint, sql string, args ...any) (pglib.CommandTag, error) {
+							return pglib.CommandTag{}, nil
+						},
+					}
+					return f(&mockTx)
+				},
+				CloseFn: func(ctx context.Context) error { return nil },
+			},
+			adapter:    &mockAdapter{},
+			dmlAdapter: mustNewDMLAdapter(t),
+			batch: batch.NewBatch([]*walMessage{
+				deleteMsg(float64(1)),
+			}, []wal.CommitPosition{testCommitPosition}),
+			checkpointer: func(ctx context.Context, positions []wal.CommitPosition) error { return errTest },
+
+			wantErr: errTest,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			writer := &BatchWriter{
+				Writer: &Writer{
+					logger:       loglib.NewNoopLogger(),
+					pgConn:       tc.pgconn,
+					checkpointer: tc.checkpointer,
+					adapter:      tc.adapter,
+				},
+				dmlAdapter:  tc.dmlAdapter,
+				batchSender: batchmocks.NewBatchSender[*walMessage](),
+			}
+			defer writer.Close()
+
+			err := writer.sendBatch(context.Background(), tc.batch)
+			require.ErrorIs(t, err, tc.wantErr)
+
+			if tc.assert != nil {
+				tc.assert(t)
+			}
+		})
+	}
+}
+
+func TestBatchWriter_flushQueries(t *testing.T) {
+	t.Parallel()
+
+	testQuerySQL := "INSERT INTO test(id, name) VALUES($1, $2)"
+	args1 := []any{1, "alice"}
+	args2 := []any{2, "bob"}
+
+	testQuery := func(args []any) *query {
+		return &query{
+			sql:  testQuerySQL,
+			args: args,
+		}
+	}
+	execCalls := uint(0)
+
+	tests := []struct {
+		name            string
+		pgconn          *pgmocks.Querier
+		queries         []*query
+		disableTriggers bool
+
+		wantExecCalls uint
+		wantErr       error
+	}{
+		{
+			name: "ok - no queries",
+			pgconn: &pgmocks.Querier{
+				ExecInTxFn: func(ctx context.Context, f func(tx pglib.Tx) error) error {
+					return errors.New("ExecInTxFn: should not be called")
+				},
+			},
+			queries: []*query{},
+
+			wantExecCalls: 0,
+			wantErr:       nil,
+		},
+		{
+			name: "ok",
+			pgconn: &pgmocks.Querier{
+				ExecInTxFn: func(ctx context.Context, f func(tx pglib.Tx) error) error {
+					mockTx := pgmocks.Tx{
+						ExecFn: func(ctx context.Context, i uint, query string, args ...any) (pglib.CommandTag, error) {
+							execCalls++
+							switch i {
+							case 1:
+								require.Equal(t, testQuerySQL, query)
+								require.Equal(t, args1, args)
+								return pglib.CommandTag{}, nil
+							case 2:
+								require.Equal(t, testQuerySQL, query)
+								require.Equal(t, args2, args)
+								return pglib.CommandTag{}, &pglib.ErrConstraintViolation{}
+							default:
+								return pglib.CommandTag{}, fmt.Errorf("unexpected call to tx ExecFn: %v", args[1])
+							}
+						},
+					}
+					return f(&mockTx)
+				},
+			},
+			queries: []*query{testQuery(args1), testQuery(args2)},
+
+			wantExecCalls: 3,
+			wantErr:       nil,
+		},
+		{
+			name: "ok - disable triggers",
+			pgconn: &pgmocks.Querier{
+				ExecInTxFn: func(ctx context.Context, f func(tx pglib.Tx) error) error {
+					mockTx := pgmocks.Tx{
+						ExecFn: func(ctx context.Context, i uint, query string, args ...any) (pglib.CommandTag, error) {
+							execCalls++
+							switch i {
+							case 1:
+								require.Equal(t, "SET session_replication_role = replica", query)
+							case 2:
+								require.Equal(t, testQuerySQL, query)
+								require.Len(t, args, 2)
+								if args[0] != args1[0] && args[0] != args2[0] {
+									return pglib.CommandTag{}, fmt.Errorf("unexpected arguments in query: %v", args)
+								}
+								if args[0] == args1[0] {
+									require.Equal(t, args1, args)
+								}
+								// the second time it's called we don't return a retriable error
+								if args[0] == args2[0] {
+									require.Equal(t, args2, args)
+								}
+							case 3:
+								if query == testQuerySQL {
+									require.Equal(t, args2, args)
+									return pglib.CommandTag{}, &pglib.ErrConstraintViolation{}
+								}
+								require.Equal(t, "SET session_replication_role = DEFAULT", query)
+							default:
+								return pglib.CommandTag{}, fmt.Errorf("unexpected call to tx ExecFn: %v", args[1])
+							}
+							return pglib.CommandTag{}, nil
+						},
+					}
+					return f(&mockTx)
+				},
+			},
+			queries:         []*query{testQuery(args1), testQuery(args2)},
+			disableTriggers: true,
+
+			wantExecCalls: 6,
+			wantErr:       nil,
+		},
+		{
+			// #1037: a client-side encoding failure is deterministic and
+			// attributable to one query, so it must drop that query and retry
+			// the rest rather than failing the whole send — which, with
+			// ignore_send_errors, dropped co-batched writes to other tables.
+			name: "ok - value encoding error drops only the failing query",
+			pgconn: &pgmocks.Querier{
+				ExecInTxFn: func(ctx context.Context, f func(tx pglib.Tx) error) error {
+					mockTx := pgmocks.Tx{
+						ExecFn: func(ctx context.Context, i uint, query string, args ...any) (pglib.CommandTag, error) {
+							execCalls++
+							switch i {
+							case 1:
+								require.Equal(t, testQuerySQL, query)
+								require.Equal(t, args1, args)
+								return pglib.CommandTag{}, nil
+							case 2:
+								require.Equal(t, testQuerySQL, query)
+								require.Equal(t, args2, args)
+								return pglib.CommandTag{}, fmt.Errorf("executing query: %w",
+									&pglib.ErrValueEncoding{Details: `failed to encode args[1]: unable to encode []interface {}{"BiteScan"}`})
+							default:
+								return pglib.CommandTag{}, fmt.Errorf("unexpected call to tx ExecFn: %v", args[1])
+							}
+						},
+					}
+					return f(&mockTx)
+				},
+			},
+			queries: []*query{testQuery(args1), testQuery(args2)},
+
+			// query1, failing query2, then query1 again on the retry
+			wantExecCalls: 3,
+			wantErr:       nil,
+		},
+		{
+			// the retrier re-invokes the tx closure, so state recorded by a
+			// failed attempt must not leak into a later successful one:
+			// attempt 1 fails on query 2, attempt 2 commits both, and nothing
+			// may be reported as needing a retry or as dropped.
+			name: "ok - retried tx that succeeds reports nothing to retry",
+			pgconn: &pgmocks.Querier{
+				ExecInTxFn: func(ctx context.Context, f func(tx pglib.Tx) error) error {
+					attempt := 0
+					var runAttempt func() error
+					runAttempt = func() error {
+						attempt++
+						failing := attempt == 1
+						mockTx := pgmocks.Tx{
+							ExecFn: func(ctx context.Context, i uint, query string, args ...any) (pglib.CommandTag, error) {
+								execCalls++
+								if failing && i == 2 {
+									// transient failure, not attributable to the query
+									return pglib.CommandTag{}, errTest
+								}
+								return pglib.CommandTag{}, nil
+							},
+						}
+						if err := f(&mockTx); err != nil && attempt == 1 {
+							return runAttempt()
+						}
+						return nil
+					}
+					return runAttempt()
+				},
+			},
+			queries: []*query{testQuery(args1), testQuery(args2)},
+
+			// attempt 1: query1, query2 (fails); attempt 2: query1, query2
+			wantExecCalls: 4,
+			wantErr:       nil,
+		},
+		{
+			name: "error - internal error in tx exec",
+			pgconn: &pgmocks.Querier{
+				ExecInTxFn: func(ctx context.Context, f func(tx pglib.Tx) error) error {
+					mockTx := pgmocks.Tx{
+						ExecFn: func(ctx context.Context, i uint, query string, args ...any) (pglib.CommandTag, error) {
+							execCalls++
+							switch i {
+							case 1:
+								require.Equal(t, testQuerySQL, query)
+								require.Equal(t, args1, args)
+								return pglib.CommandTag{}, nil
+							case 2:
+								require.Equal(t, testQuerySQL, query)
+								require.Equal(t, args2, args)
+								return pglib.CommandTag{}, errTest
+							default:
+								return pglib.CommandTag{}, fmt.Errorf("unexpected call to tx ExecFn: %v", args[1])
+							}
+						},
+					}
+					return f(&mockTx)
+				},
+			},
+			queries: []*query{testQuery(args1), testQuery(args2)},
+
+			wantExecCalls: 2,
+			wantErr:       errTest,
+		},
+		{
+			name: "error - setting replication role to replica",
+			pgconn: &pgmocks.Querier{
+				ExecInTxFn: func(ctx context.Context, f func(tx pglib.Tx) error) error {
+					mockTx := pgmocks.Tx{
+						ExecFn: func(ctx context.Context, i uint, query string, args ...any) (pglib.CommandTag, error) {
+							execCalls++
+							switch i {
+							case 1:
+								require.Equal(t, "SET session_replication_role = replica", query)
+								return pglib.CommandTag{}, errTest
+							default:
+								return pglib.CommandTag{}, fmt.Errorf("unexpected call to tx ExecFn: %v", args[1])
+							}
+						},
+					}
+					return f(&mockTx)
+				},
+			},
+			queries:         []*query{testQuery(args1), testQuery(args2)},
+			disableTriggers: true,
+
+			wantExecCalls: 1,
+			wantErr:       errTest,
+		},
+		{
+			name: "error - resetting replication role to replica",
+			pgconn: &pgmocks.Querier{
+				ExecInTxFn: func(ctx context.Context, f func(tx pglib.Tx) error) error {
+					mockTx := pgmocks.Tx{
+						ExecFn: func(ctx context.Context, i uint, query string, args ...any) (pglib.CommandTag, error) {
+							execCalls++
+							switch i {
+							case 1:
+								require.Equal(t, "SET session_replication_role = replica", query)
+							case 2:
+								require.Equal(t, testQuerySQL, query)
+								require.Equal(t, args1, args)
+							case 3:
+								require.Equal(t, "SET session_replication_role = DEFAULT", query)
+								return pglib.CommandTag{}, errTest
+							default:
+								return pglib.CommandTag{}, fmt.Errorf("unexpected call to tx ExecFn: %v", args[1])
+							}
+							return pglib.CommandTag{}, nil
+						},
+					}
+					return f(&mockTx)
+				},
+			},
+			queries:         []*query{testQuery(args1)},
+			disableTriggers: true,
+
+			wantExecCalls: 3,
+			wantErr:       errTest,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			bw := &BatchWriter{
+				Writer: &Writer{
+					logger:          loglib.NewNoopLogger(),
+					pgConn:          tc.pgconn,
+					disableTriggers: tc.disableTriggers,
+				},
+			}
+
+			err := bw.flushQueries(context.Background(), tc.queries)
+			require.ErrorIs(t, err, tc.wantErr)
+			require.Equal(t, tc.wantExecCalls, execCalls)
+			execCalls = 0
+		})
+	}
+}
+
+func TestBatchWriter_execQueries_strictMode(t *testing.T) {
+	t.Parallel()
+
+	testQuerySQL := "INSERT INTO test(id, name) VALUES($1, $2)"
+	testQuery := func(args []any) *query {
+		return &query{sql: testQuerySQL, args: args}
+	}
+
+	// pgConn where the first query succeeds and the second fails with a
+	// non-internal (DATALOSS) constraint violation.
+	newPgConn := func() *pgmocks.Querier {
+		return &pgmocks.Querier{
+			ExecInTxFn: func(ctx context.Context, f func(tx pglib.Tx) error) error {
+				mockTx := pgmocks.Tx{
+					ExecFn: func(ctx context.Context, i uint, query string, args ...any) (pglib.CommandTag, error) {
+						if i == 1 {
+							return pglib.CommandTag{}, nil
+						}
+						return pglib.CommandTag{}, &pglib.ErrConstraintViolation{}
+					},
+				}
+				return f(&mockTx)
+			},
+		}
+	}
+
+	queries := []*query{testQuery([]any{1, "alice"}), testQuery([]any{2, "bob"})}
+
+	t.Run("default mode drops and continues", func(t *testing.T) {
+		t.Parallel()
+		bw := &BatchWriter{
+			Writer: &Writer{
+				logger: loglib.NewNoopLogger(),
+				pgConn: newPgConn(),
+			},
+		}
+
+		retry, err := bw.execQueries(context.Background(), queries)
+		require.NoError(t, err)
+		// the failing query is dropped, the succeeding one is returned for retry
+		require.Len(t, retry, 1)
+		require.Equal(t, []any{1, "alice"}, retry[0].args)
+		require.Equal(t, uint64(1), bw.DroppedQueries())
+	})
+
+	t.Run("strict mode returns the error", func(t *testing.T) {
+		t.Parallel()
+		bw := &BatchWriter{
+			Writer: &Writer{
+				logger:     loglib.NewNoopLogger(),
+				pgConn:     newPgConn(),
+				strictMode: true,
+			},
+		}
+
+		retry, err := bw.execQueries(context.Background(), queries)
+		require.Error(t, err)
+		var cv *pglib.ErrConstraintViolation
+		require.ErrorAs(t, err, &cv)
+		// the message is what a snapshot caller sees when rows would otherwise
+		// be dropped silently, so it is part of the contract
+		require.ErrorContains(t, err, "strict mode: stopping on non-internal query failure")
+		require.Nil(t, retry)
+		require.Equal(t, uint64(0), bw.DroppedQueries())
+	})
+}
+
+func Test_isConcurrentDDL(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		sql  string
+		want bool
+	}{
+		{name: "create table", sql: "create table test (id int)", want: false},
+		{name: "create index", sql: "CREATE INDEX test_idx ON test (id)", want: false},
+		{name: "create index concurrently", sql: "CREATE INDEX CONCURRENTLY test_idx ON test (id)", want: true},
+		{name: "create unique index concurrently", sql: "create unique index concurrently test_idx on test (id)", want: true},
+		{name: "drop index concurrently lowercase", sql: "drop index concurrently test_idx", want: true},
+		{name: "reindex concurrently", sql: "REINDEX INDEX CONCURRENTLY test_idx", want: true},
+		{name: "refresh materialized view concurrently", sql: "REFRESH MATERIALIZED VIEW CONCURRENTLY mv", want: true},
+		{name: "detach partition concurrently", sql: "ALTER TABLE test DETACH PARTITION test_p1 CONCURRENTLY", want: true},
+		{name: "leading whitespace and newline", sql: "\n\t create index concurrently\n test_idx on test (id)", want: true},
+		// The keyword alone does not make a statement non-transactional.
+		{name: "concurrently as part of an identifier", sql: "create table concurrently_run (id int)", want: false},
+		{name: "concurrently in a string literal", sql: "COMMENT ON TABLE test IS 'built concurrently'", want: false},
+		{name: "concurrently in a column default", sql: "create table test (note text default 'run concurrently')", want: false},
+		{name: "concurrently in a quoted identifier", sql: `create table test ("concurrently" int)`, want: false},
+		{name: "concurrently in a trailing comment", sql: "create table test (id int) -- concurrently", want: false},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			require.Equal(t, tc.want, isConcurrentDDL(tc.sql))
+		})
+	}
+}
+
+func mustNewDMLAdapter(t *testing.T) *dmlAdapter {
+	t.Helper()
+	a, err := newDMLAdapter("", false, loglib.NewNoopLogger())
+	require.NoError(t, err)
+	return a
+}
+
+func TestBatchWriter_execQueries_pipelined(t *testing.T) {
+	t.Parallel()
+
+	newQuery := func(name string) *query {
+		return &query{sql: "INSERT INTO test(name) VALUES($1)", args: []any{name}}
+	}
+	queries := []*query{newQuery("alice"), newQuery("bob"), newQuery("carol")}
+	// A constraint violation is a query error, not an internal one. execQueries
+	// drops it and retries the rest, which is the behaviour under test.
+	errFailed := &pglib.ErrConstraintViolation{}
+
+	tests := []struct {
+		name      string
+		failAt    int   // index of the query the server rejects, -1 for none
+		batchErr  error // a failure of the batch itself, with no query to blame
+		wantSent  int
+		wantRetry []any
+		wantDrops uint64
+		wantErr   bool
+	}{
+		{
+			name:      "ok - one exchange for all queries",
+			failAt:    -1,
+			wantSent:  3,
+			wantRetry: nil,
+		},
+		{
+			name:      "one query fails - it is dropped and the rest are retried",
+			failAt:    1,
+			wantSent:  3,
+			wantRetry: []any{"alice", "carol"},
+		},
+		{
+			// The batch never reached the server, or it broke once every query
+			// had answered. Blaming a query here would drop one that did
+			// nothing wrong, and returning the rest would lose the batch in
+			// silence, so the failure has to travel up.
+			name:     "the batch fails with no query to blame - nothing is dropped",
+			failAt:   -1,
+			batchErr: errFailed,
+			wantSent: 3,
+			wantErr:  true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			sent := 0
+			w := &BatchWriter{
+				Writer: &Writer{
+					logger: loglib.NewNoopLogger(),
+					pgConn: &pgmocks.Querier{
+						ExecInTxFn: func(ctx context.Context, f func(tx pglib.Tx) error) error {
+							mockTx := pgmocks.Tx{
+								// The whole batch arrives in one call. That is the
+								// point of the change: one round trip, not one for
+								// each query.
+								ExecBatchFn: func(ctx context.Context, qs []pglib.BatchQuery) error {
+									sent = len(qs)
+									switch {
+									case tc.batchErr != nil:
+										return tc.batchErr
+									case tc.failAt >= 0:
+										return &pglib.BatchQueryError{Index: tc.failAt, Err: errFailed}
+									default:
+										return nil
+									}
+								},
+								ExecFn: func(ctx context.Context, i uint, q string, args ...any) (pglib.CommandTag, error) {
+									return pglib.CommandTag{}, nil
+								},
+							}
+							return f(&mockTx)
+						},
+					},
+				},
+			}
+
+			retry, err := w.execQueries(context.Background(), queries)
+			require.Equal(t, tc.wantSent, sent)
+			if tc.wantErr {
+				require.Error(t, err)
+				require.Empty(t, retry)
+				require.Equal(t, tc.wantDrops, w.DroppedQueries())
+				return
+			}
+			require.NoError(t, err)
+
+			gotRetry := []any{}
+			for _, q := range retry {
+				gotRetry = append(gotRetry, q.args[0])
+			}
+			if tc.wantRetry == nil {
+				require.Empty(t, gotRetry)
+			} else {
+				require.Equal(t, tc.wantRetry, gotRetry)
+			}
+		})
+	}
+}
+
+// A batch failure that names no query is handed to the isolation pass, and
+// what the pass learns is what the writer reports. The batch error only says
+// that a step over the whole batch went wrong; the error the server gives the
+// query on its own names the column or the value, and that is what a dropped
+// query has to record.
+func TestBatchWriter_execQueries_isolation(t *testing.T) {
+	t.Parallel()
+
+	newQuery := func(name string) *query {
+		return &query{sql: "INSERT INTO test(name) VALUES($1)", args: []any{name}}
+	}
+	queries := []*query{newQuery("alice"), newQuery("bob"), newQuery("carol")}
+
+	// pgx encodes the arguments of the whole batch before it executes any of
+	// it, so a value it cannot encode surfaces on the first read whichever
+	// statement owns it, and carries no index.
+	batchErr := error(&pglib.ErrValueEncoding{Details: "failed to encode args[0]"})
+	// What the same value answers when its own statement runs on its own,
+	// which is the sentence that names it.
+	queryErr := error(&pglib.ErrValueEncoding{
+		Details: `failed to encode args[0] for "name": cannot find encode plan`,
+	})
+
+	const failing = 1
+
+	newWriter := func(strict bool, passes *int, rollback *bool) *BatchWriter {
+		return &BatchWriter{
+			Writer: &Writer{
+				strictMode: strict,
+				logger:     loglib.NewNoopLogger(),
+				pgConn: &pgmocks.Querier{
+					ExecInTxFn: func(ctx context.Context, f func(tx pglib.Tx) error) error {
+						*passes++
+						first := *passes == 1
+						mockTx := pgmocks.Tx{
+							ExecBatchFn: func(ctx context.Context, qs []pglib.BatchQuery) error {
+								return batchErr
+							},
+							ExecFn: func(ctx context.Context, i uint, q string, args ...any) (pglib.CommandTag, error) {
+								// The isolation pass runs the queries one at a
+								// time. i counts the calls of this mock, and
+								// the pass opens with the replication role.
+								if !first && len(args) == 1 && args[0] == queries[failing].args[0] {
+									return pglib.CommandTag{}, queryErr
+								}
+								return pglib.CommandTag{}, nil
+							},
+						}
+						err := f(&mockTx)
+						if errors.Is(err, pglib.ErrTxRollback) {
+							*rollback = true
+						}
+						return err
+					},
+				},
+			},
+		}
+	}
+
+	t.Run("the isolated query is dropped and the rest are retried", func(t *testing.T) {
+		t.Parallel()
+
+		passes, rollback := 0, false
+		w := newWriter(false, &passes, &rollback)
+
+		retry, err := w.execQueries(context.Background(), queries)
+		require.NoError(t, err)
+		require.Equal(t, 2, passes, "the batch is sent, then the queries are isolated")
+		require.True(t, rollback, "the isolation pass keeps nothing")
+		require.Equal(t, uint64(1), w.DroppedQueries())
+
+		gotRetry := make([]any, 0, len(retry))
+		for _, q := range retry {
+			gotRetry = append(gotRetry, q.args[0])
+		}
+		require.Equal(t, []any{"alice", "carol"}, gotRetry)
+	})
+
+	t.Run("the reported cause is what the isolated query failed with", func(t *testing.T) {
+		t.Parallel()
+
+		passes, rollback := 0, false
+		w := newWriter(true, &passes, &rollback)
+
+		_, err := w.execQueries(context.Background(), queries)
+		require.ErrorIs(t, err, queryErr)
+		require.NotErrorIs(t, err, batchErr)
+	})
+}

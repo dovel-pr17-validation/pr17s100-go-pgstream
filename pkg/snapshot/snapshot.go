@@ -1,0 +1,125 @@
+// SPDX-License-Identifier: Apache-2.0
+
+package snapshot
+
+import pglib "github.com/xataio/pgstream/internal/postgres"
+
+type Snapshot struct {
+	SchemaTables         map[string][]string
+	SchemaExcludedTables map[string][]string
+	// SchemaOnlyTables are part of the schema snapshot scope, but their data
+	// is not copied. SchemaTables entries listed by exact name (no wildcards)
+	// take precedence over a schema-only wildcard match, and
+	// SchemaExcludedTables take precedence over the schema-only list.
+	SchemaOnlyTables map[string][]string
+	// TableColumns pins the dumped columns.
+	// Nil resolves at read time.
+	TableColumns pglib.SchemaTableColumns
+}
+
+type Request struct {
+	Schema string
+	Tables []string
+	Status Status
+	Mode   RequestMode
+	Errors *SchemaErrors
+}
+
+type Status string
+
+const (
+	StatusRequested  = Status("requested")
+	StatusInProgress = Status("in progress")
+	StatusCompleted  = Status("completed")
+)
+
+// RequestMode captures what a snapshot request replicated to the target:
+// schema and data (data mode), or schema only.
+type RequestMode string
+
+const (
+	RequestModeData       = RequestMode("data")
+	RequestModeSchemaOnly = RequestMode("schema-only")
+)
+
+// GetMode returns the request mode, defaulting to data mode for requests
+// recorded before the mode was tracked.
+func (r *Request) GetMode() RequestMode {
+	if r.Mode == "" {
+		return RequestModeData
+	}
+	return r.Mode
+}
+
+func (s *Snapshot) GetSchemas() []string {
+	if s == nil {
+		return nil
+	}
+
+	schemas := make([]string, 0, len(s.SchemaTables))
+	for schema := range s.SchemaTables {
+		schemas = append(schemas, schema)
+	}
+	return schemas
+}
+
+func (s *Snapshot) GetTables() []string {
+	if s == nil {
+		return nil
+	}
+
+	tables := []string{}
+	for schema, schemaTables := range s.SchemaTables {
+		for _, table := range schemaTables {
+			tables = append(tables, schema+"."+table)
+		}
+	}
+	return tables
+}
+
+func (s *Snapshot) HasTables() bool {
+	if s == nil {
+		return false
+	}
+
+	for _, tables := range s.SchemaTables {
+		if len(tables) > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *Snapshot) HasSchemaOnlyTables() bool {
+	if s == nil {
+		return false
+	}
+
+	for _, tables := range s.SchemaOnlyTables {
+		if len(tables) > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+func (r *Request) MarkCompleted(schema string, err error) {
+	r.Status = StatusCompleted
+	r.Errors = NewSchemaErrors(schema, err)
+}
+
+func (r *Request) MarkInProgress() {
+	r.Status = StatusInProgress
+}
+
+func (r *Request) IsPending() bool {
+	return r.Status == StatusRequested
+}
+
+func (r *Request) HasFailed() bool {
+	return r.Status == StatusCompleted && r.Errors != nil
+}
+
+func (r *Request) HasFailedForTable(table string) bool {
+	return r.Status == StatusCompleted && r.Errors.IsTableError(table)
+}

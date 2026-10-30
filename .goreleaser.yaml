@@ -1,0 +1,105 @@
+version: 2
+
+project_name: pgstream
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: build_noncgo
+    binary: pgstream
+    # mod_timestamp pins the binary timestamp to the commit time so builds are
+    # reproducible (and the SBOM/signatures stay stable on re-runs).
+    mod_timestamp: "{{ .CommitTimestamp }}"
+    ldflags:
+      - -s -w
+      - -X github.com/xataio/pgstream/cmd.Version={{ .Version }}
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - windows
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+    ignore:
+      - goos: windows
+        goarch: arm64
+
+release:
+  draft: true
+
+brews:
+  - name: pgstream
+    homepage: "https://www.xata.io"
+    description: "PostgreSQL replication with DDL changes"
+    license: "Apache-2.0"
+    repository:
+      token: "{{ .Env.TAP_GITHUB_TOKEN }}"
+      owner: "{{ .Env.GITHUB_USERNAME }}"
+      name: homebrew-pgstream
+
+archives:
+  - formats: [binary]
+    name_template: >-
+      {{ .ProjectName }}.{{ if eq .Os "windows" }}win{{ else if eq .Os "darwin" }}macos{{ else }}{{ .Os }}{{ end }}.{{ .Arch }}
+    files:
+      - LICENSE*
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+
+# Signing and SBOM are handled outside GoReleaser via GitHub artifact
+# attestations (see .github/workflows/build.yml), so no cosign/syft blocks are
+# needed here.
+
+checksum:
+  name_template: "checksums.txt"
+
+dockers:
+  - image_templates:
+      - "{{ .Env.DOCKER_USERNAME }}/{{ .ProjectName }}:{{ .Version }}-amd64"
+    dockerfile: Dockerfile
+    use: buildx
+    build_flag_templates:
+      - --platform=linux/amd64
+      - --label=org.opencontainers.image.title={{ .ProjectName }}
+      - --label=org.opencontainers.image.description={{ .ProjectName }}
+      - --label=org.opencontainers.image.url=https://github.com/{{ .Env.GITHUB_USERNAME }}/{{ .ProjectName }}
+      - --label=org.opencontainers.image.source=https://github.com/{{ .Env.GITHUB_USERNAME }}/{{ .ProjectName }}
+      - --label=org.opencontainers.image.version={{ .Version }}
+      - --label=org.opencontainers.image.created={{ .Date }}
+      - --label=org.opencontainers.image.revision={{ .FullCommit }}
+      - --label=org.opencontainers.image.licenses=Apache-2.0
+  - image_templates:
+      - "{{ .Env.DOCKER_USERNAME }}/{{ .ProjectName }}:{{ .Version }}-arm64"
+    goarch: arm64
+    dockerfile: Dockerfile
+    use: buildx
+    build_flag_templates:
+      - --platform=linux/arm64
+      - --label=org.opencontainers.image.title={{ .ProjectName }}
+      - --label=org.opencontainers.image.description={{ .ProjectName }}
+      - --label=org.opencontainers.image.url=https://github.com/{{ .Env.GITHUB_USERNAME }}/{{ .ProjectName }}
+      - --label=org.opencontainers.image.source=https://github.com/{{ .Env.GITHUB_USERNAME }}/{{ .ProjectName }}
+      - --label=org.opencontainers.image.version={{ .Version }}
+      - --label=org.opencontainers.image.created={{ .Date }}
+      - --label=org.opencontainers.image.revision={{ .FullCommit }}
+      - --label=org.opencontainers.image.licenses=Apache-2.0
+
+docker_manifests:
+  # Version tag without the "v" prefix (e.g. 1.1.0) and a moving "latest".
+  - name_template: "{{ .Env.DOCKER_USERNAME }}/{{ .ProjectName }}:{{ .Version }}"
+    image_templates:
+      - "{{ .Env.DOCKER_USERNAME }}/{{ .ProjectName }}:{{ .Version }}-amd64"
+      - "{{ .Env.DOCKER_USERNAME }}/{{ .ProjectName }}:{{ .Version }}-arm64"
+  - name_template: "{{ .Env.DOCKER_USERNAME }}/{{ .ProjectName }}:latest"
+    image_templates:
+      - "{{ .Env.DOCKER_USERNAME }}/{{ .ProjectName }}:{{ .Version }}-amd64"
+      - "{{ .Env.DOCKER_USERNAME }}/{{ .ProjectName }}:{{ .Version }}-arm64"

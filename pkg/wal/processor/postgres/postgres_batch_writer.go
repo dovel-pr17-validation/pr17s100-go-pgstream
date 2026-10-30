@@ -1,0 +1,475 @@
+// SPDX-License-Identifier: Apache-2.0
+
+package postgres
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"regexp"
+	"runtime/debug"
+
+	pglib "github.com/xataio/pgstream/internal/postgres"
+	loglib "github.com/xataio/pgstream/pkg/log"
+	"github.com/xataio/pgstream/pkg/wal"
+	"github.com/xataio/pgstream/pkg/wal/processor"
+	"github.com/xataio/pgstream/pkg/wal/processor/batch"
+)
+
+// prependSearchPath puts the event schema first, keeping the existing entries.
+// The upstream search path is not part of the DDL event, so the schema postgres
+// reports for the affected objects stands in for it. Unqualified DDL that
+// resolves through a schema other than the one it affects still lands wherever
+// the target search path points, as it did before.
+const prependSearchPath = `SELECT pg_catalog.set_config('search_path',
+	pg_catalog.concat_ws(', ', $1::text, NULLIF(pg_catalog.current_setting('search_path'), '')), true)`
+
+// BatchWriter is a WAL processor implementation that batches and writes wal
+// events to a Postgres instance. It coalesces consecutive same-table DML
+// events into bulk SQL statements for improved throughput.
+type BatchWriter struct {
+	*Writer
+
+	batchSender walMessageBatchSender
+	dmlAdapter  *dmlAdapter
+}
+
+const batchWriter = "postgres_batch_writer"
+
+// NewBatchWriter returns a postgres processor that batches and writes data to
+// the configured postgres instance.
+func NewBatchWriter(ctx context.Context, config *Config, opts ...WriterOption) (*BatchWriter, error) {
+	w, err := newWriter(ctx, config, batchWriter, opts...)
+	if err != nil {
+		return nil, err
+	}
+
+	dml, err := newDMLAdapter(config.OnConflictAction, false, w.logger)
+	if err != nil {
+		return nil, err
+	}
+
+	bw := &BatchWriter{
+		Writer:     w,
+		dmlAdapter: dml,
+	}
+
+	// The ordered batch writer (replication path) must send strictly in order,
+	// so it never uses the send-drainer pool, regardless of the SendConcurrency
+	// carried by the shared Config: in snapshot_and_replication mode the
+	// bulk-ingest snapshot writer and this writer are built from the same
+	// postgres.Config, and bulk ingest defaults SendConcurrency to >1.
+	batchConfig := config.BatchConfig
+	batchConfig.SendConcurrency = 1
+	bw.batchSender, err = batch.NewSender(ctx, &batchConfig, bw.sendBatch, w.logger,
+		batch.WithDroppedCounter[*walMessage](w.dropped))
+	if err != nil {
+		return nil, err
+	}
+
+	if err := w.initDroppedQueriesMetric(); err != nil {
+		return nil, fmt.Errorf("initialising postgres batch writer metrics: %w", err)
+	}
+
+	return bw, nil
+}
+
+// ProcessWALEvent is called on every new message from the wal. It can be called
+// concurrently.
+func (w *BatchWriter) ProcessWALEvent(ctx context.Context, walEvent *wal.Event) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			w.logger.Panic("[PANIC] Panic while processing replication event", loglib.Fields{
+				"wal_data":    walEvent,
+				"panic":       r,
+				"stack_trace": debug.Stack(),
+			})
+
+			err = fmt.Errorf("postgres writer: understanding event: %w:  %v", processor.ErrPanic, r)
+		}
+	}()
+
+	walMsg, err := w.adapter.walEventToMessage(ctx, walEvent)
+	if err != nil {
+		return err
+	}
+
+	msg := batch.NewWALMessage(walMsg, walEvent.CommitPosition)
+	if err := w.batchSender.SendMessage(ctx, msg); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (w *BatchWriter) Name() string {
+	return batchWriter
+}
+
+func (w *BatchWriter) Close() error {
+	w.logger.Debug("closing batch writer")
+	senderErr := w.batchSender.Close()
+	return errors.Join(senderErr, w.close())
+}
+
+func (w *BatchWriter) sendBatch(ctx context.Context, b *batch.Batch[*walMessage]) error {
+	messages := b.GetMessages()
+	if len(messages) > 0 {
+		w.logger.Debug("sending batch", loglib.Fields{"batch_size": len(messages)})
+
+		// Walk messages in order, building "runs" of consecutive
+		// same-(schema, table, action) DML events that can be coalesced.
+		var currentRun []*walMessage
+		var runSchema, runTable, runAction string
+
+		flushRun := func() error {
+			if len(currentRun) == 0 {
+				return nil
+			}
+			queries, err := w.buildCoalescedQueries(currentRun)
+			if err != nil {
+				w.logger.Error(err, "building coalesced queries", loglib.Fields{
+					"action": runAction, "schema": runSchema, "table": runTable, "run_size": len(currentRun),
+				})
+				return err
+			}
+			if err := w.flushQueries(ctx, queries); err != nil {
+				w.logger.Error(err, "flushing coalesced DML queries")
+				return err
+			}
+			currentRun = currentRun[:0]
+			return nil
+		}
+
+		for _, msg := range messages {
+			if msg.IsEmpty() {
+				continue
+			}
+
+			if msg.isDDL {
+				// flush any pending DML run before executing DDL
+				if err := flushRun(); err != nil {
+					return err
+				}
+
+				ddlQueries, err := w.adapter.walEventToQueries(ctx, &wal.Event{Data: msg.data})
+				if err != nil {
+					w.logger.Error(err, "converting DDL event to queries")
+					return err
+				}
+				for _, q := range ddlQueries {
+					if q.IsEmpty() {
+						continue
+					}
+					if err := w.execDDLQuery(ctx, q); err != nil {
+						w.logger.Error(err, "running DDL query", loglib.Fields{"query_sql": q.sql, "query_args": q.args})
+						if !w.isInternalError(err) {
+							if w.strictMode {
+								return fmt.Errorf("strict mode: stopping on non-internal DDL failure: %w", err)
+							}
+							w.recordDroppedQuery(q, err)
+							continue
+						}
+						return err
+					}
+				}
+				continue
+			}
+
+			// check if this message continues the current run
+			if len(currentRun) > 0 && (msg.data.Schema != runSchema || msg.data.Table != runTable || msg.data.Action != runAction) {
+				if err := flushRun(); err != nil {
+					return err
+				}
+			}
+
+			if len(currentRun) == 0 {
+				runSchema = msg.data.Schema
+				runTable = msg.data.Table
+				runAction = msg.data.Action
+			}
+			currentRun = append(currentRun, msg)
+		}
+
+		// flush any trailing run
+		if err := flushRun(); err != nil {
+			return err
+		}
+	}
+
+	if w.checkpointer != nil && len(b.GetCommitPositions()) > 0 {
+		return w.checkpointer(ctx, b.GetCommitPositions())
+	}
+
+	return nil
+}
+
+// execDDLQuery replays DDL under the upstream schema search path. The search
+// path can only be scoped to the DDL with SET LOCAL, which requires a
+// transaction, so statements postgres refuses to run in one are replayed as
+// they were before, on the target's own search path.
+func (w *BatchWriter) execDDLQuery(ctx context.Context, q *query) error {
+	if q.schema == "" {
+		_, err := w.pgConn.Exec(ctx, q.sql, q.args...)
+		return err
+	}
+
+	if isConcurrentDDL(q.sql) {
+		return w.execDDLQueryOutsideTx(ctx, q)
+	}
+
+	err := w.pgConn.ExecInTx(ctx, func(tx pglib.Tx) error {
+		if _, err := tx.Exec(ctx, prependSearchPath, pglib.QuoteIdentifier(q.schema)); err != nil {
+			return fmt.Errorf("setting search path to %q for DDL replay: %w", q.schema, err)
+		}
+		_, err := tx.Exec(ctx, q.sql, q.args...)
+		return err
+	})
+	// isConcurrentDDL only recognises the statements known to be
+	// transaction-unsafe. Postgres is the authority, and it rejects them before
+	// doing any work, so a rejection is a safe signal to replay outside the tx
+	// rather than a failure to report.
+	var errActiveTx *pglib.ErrActiveSQLTransaction
+	if errors.As(err, &errActiveTx) {
+		return w.execDDLQueryOutsideTx(ctx, q)
+	}
+
+	return err
+}
+
+func (w *BatchWriter) execDDLQueryOutsideTx(ctx context.Context, q *query) error {
+	w.logger.Warn(nil, "replaying DDL that cannot run in a transaction without the upstream search path, it may apply to the wrong schema", loglib.Fields{
+		"sql":      q.sql,
+		"schema":   q.schema,
+		"severity": "DATALOSS",
+	})
+	_, err := w.pgConn.Exec(ctx, q.sql, q.args...)
+	return err
+}
+
+// concurrentDDL matches DDL commands postgres rejects inside transaction
+// blocks. It is a fast path only: anything it misses is caught by the
+// active_sql_transaction error postgres returns.
+var concurrentDDL = regexp.MustCompile(`(?is)^\s*(create(\s+unique)?\s+index|drop\s+index|reindex|refresh\s+materialized\s+view|alter\s+table)\b.*\bconcurrently\b`)
+
+// isConcurrentDDL reports whether the statement must run outside transactions.
+func isConcurrentDDL(sql string) bool {
+	return concurrentDDL.MatchString(sql)
+}
+
+func (w *BatchWriter) buildCoalescedQueries(run []*walMessage) ([]*query, error) {
+	if len(run) == 0 {
+		return nil, nil
+	}
+
+	action := run[0].data.Action
+	switch action {
+	case "D":
+		events := make([]*wal.Data, len(run))
+		for i, m := range run {
+			events[i] = m.data
+		}
+		return w.dmlAdapter.buildBulkDeleteQuery(events, run[0].schemaInfo)
+	case "I":
+		events := make([]*wal.Data, len(run))
+		for i, m := range run {
+			events[i] = m.data
+		}
+		return w.dmlAdapter.buildBulkInsertQueries(events, run[0].schemaInfo), nil
+	default:
+		// UPDATE, TRUNCATE, and anything else: individual queries
+		queries := make([]*query, 0, len(run))
+		for _, m := range run {
+			qs, err := w.dmlAdapter.walDataToQueries(m.data, m.schemaInfo)
+			if err != nil {
+				return nil, err
+			}
+			queries = append(queries, qs...)
+		}
+		return queries, nil
+	}
+}
+
+func (w *BatchWriter) flushQueries(ctx context.Context, queries []*query) error {
+	if len(queries) == 0 {
+		return nil
+	}
+
+	var err error
+	for {
+		queries, err = w.execQueries(ctx, queries)
+		if err != nil {
+			return err
+		}
+
+		if len(queries) == 0 {
+			return nil
+		}
+	}
+}
+
+func (w *BatchWriter) execQueries(ctx context.Context, queries []*query) ([]*query, error) {
+	retryQueries := []*query{}
+	var droppedQuery *query
+	err := w.pgConn.ExecInTx(ctx, func(tx pglib.Tx) error {
+		retryQueries = []*query{}
+		droppedQuery = nil
+
+		if err := w.setReplicationRoleToReplica(ctx, tx); err != nil {
+			return err
+		}
+
+		// Send the queries as one pipeline. One round trip for the batch
+		// replaces one round trip for each query. A query the server rejects
+		// is reported with its index, which is the same index the loop found
+		// before.
+		batchQueries := make([]pglib.BatchQuery, 0, len(queries))
+		for _, q := range queries {
+			batchQueries = append(batchQueries, pglib.BatchQuery{SQL: q.sql, Args: q.args})
+		}
+
+		if err := tx.ExecBatch(ctx, batchQueries); err != nil {
+			var queryErr *pglib.BatchQueryError
+			if !errors.As(err, &queryErr) || queryErr.Index < 0 || queryErr.Index >= len(queries) {
+				// The failure belongs to the batch rather than to one of its
+				// queries: it never reached the server, or it broke once every
+				// query had answered. Dropping a query here would name one
+				// that did nothing wrong.
+				return err
+			}
+
+			w.logger.Error(err, "executing sql query", loglib.Fields{
+				"sql":  queries[queryErr.Index].sql,
+				"args": queries[queryErr.Index].args,
+			})
+			// if a query returns an error, it will abort the tx. Remove it
+			// from the list of queries to be retried.
+			droppedQuery = queries[queryErr.Index]
+			retryQueries = removeIndex(queries, queryErr.Index)
+			return err
+		}
+
+		return w.resetReplicationRole(ctx, tx)
+	})
+	if err != nil && w.isInternalError(err) {
+		// if there was an internal error in the tx, there's no point in
+		// retrying, return error and stop processing.
+		return nil, err
+	}
+
+	// dropCause is what made droppedQuery undeliverable. A query the batch
+	// named comes with the server error that named it, so the batch failure is
+	// already the precise one.
+	dropCause := err
+
+	if err != nil && droppedQuery == nil && !w.isInternalError(err) {
+		// The batch failed with no query to blame. That happens when the
+		// failure belongs to a step pgx runs over the whole batch before it
+		// executes any of it, so a second pass runs the queries one at a time
+		// and lets the server name the one at fault.
+		if index, cause := w.isolateFailingQuery(ctx, queries); index >= 0 {
+			// Report what the isolated query failed with rather than the
+			// batch error that started this. The batch error says a step over
+			// the whole batch went wrong; this one names the column, the value
+			// or the constraint, which is what a dropped query has to record.
+			dropCause = cause
+			w.logger.Error(dropCause, "executing sql query", loglib.Fields{
+				"sql":  queries[index].sql,
+				"args": queries[index].args,
+			})
+			droppedQuery = queries[index]
+			retryQueries = removeIndex(queries, index)
+		}
+	}
+
+	if err != nil && droppedQuery == nil {
+		// The transaction failed with no query to blame. Returning the queries
+		// that were not dropped would return none of them, which loses the
+		// batch without a word, so the failure travels up instead.
+		return nil, err
+	}
+
+	if err != nil && droppedQuery != nil {
+		if w.strictMode {
+			return nil, fmt.Errorf("strict mode: stopping on non-internal query failure: %w", dropCause)
+		}
+		w.recordDroppedQuery(droppedQuery, dropCause)
+	}
+
+	// if there were no errors or no internal errors in the tx, return the
+	// queries to retry (none if the tx was successful)
+	return retryQueries, nil
+}
+
+// isolateFailingQuery returns the position of the first query the server
+// rejects and the error it rejected it with, or -1 when every one of them is
+// accepted.
+//
+// The queries run one at a time rather than as a batch, because a batch tells
+// us only that something in it is wrong. Nothing is kept: the pass ends by
+// rolling the transaction back, so it answers the question without applying
+// anything. The caller drops the query it names and repeats the rest.
+//
+// It stops at the first rejection because Postgres stops there too. A
+// statement the server rejects aborts its transaction, and every statement
+// after it fails with "current transaction is aborted" whatever it says, so a
+// single pass cannot name a second one. Naming them all would need a savepoint
+// around every query, which costs two more round trips each to find a fault
+// that a batch usually has once.
+func (w *BatchWriter) isolateFailingQuery(ctx context.Context, queries []*query) (int, error) {
+	failing := -1
+	var cause error
+	err := w.pgConn.ExecInTx(ctx, func(tx pglib.Tx) error {
+		failing, cause = -1, nil
+
+		if err := w.setReplicationRoleToReplica(ctx, tx); err != nil {
+			return err
+		}
+		for i, q := range queries {
+			if _, err := tx.Exec(ctx, q.sql, q.args...); err != nil {
+				if w.isInternalError(err) {
+					return err
+				}
+				failing, cause = i, err
+				break
+			}
+		}
+		// Nothing this pass did is wanted, only what it learned.
+		return pglib.ErrTxRollback
+	})
+	if err != nil && !errors.Is(err, pglib.ErrTxRollback) {
+		w.logger.Warn(err, "isolating the failing query of a batch")
+		return -1, nil
+	}
+	return failing, cause
+}
+
+func (w *BatchWriter) isInternalError(err error) bool {
+	var errRelationDoesNotExist *pglib.ErrRelationDoesNotExist
+	var errConstraintViolation *pglib.ErrConstraintViolation
+	var errSyntaxError *pglib.ErrSyntaxError
+	var errDataException *pglib.ErrDataException
+	var errRelationAlreadyExists *pglib.ErrRelationAlreadyExists
+	var errPreconditionFailed *pglib.ErrPreconditionFailed
+	var errFeatureNotSupported *pglib.ErrFeatureNotSupported
+	var errValueEncoding *pglib.ErrValueEncoding
+	switch {
+	case errors.As(err, &errRelationDoesNotExist),
+		errors.As(err, &errConstraintViolation),
+		errors.As(err, &errSyntaxError),
+		errors.As(err, &errDataException),
+		errors.As(err, &errRelationAlreadyExists),
+		errors.As(err, &errPreconditionFailed),
+		errors.As(err, &errFeatureNotSupported),
+		errors.As(err, &errValueEncoding):
+		return false
+	default:
+		return true
+	}
+}
+
+func removeIndex(s []*query, index int) []*query {
+	ret := make([]*query, 0, len(s)-1)
+	ret = append(ret, s[:index]...)
+	return append(ret, s[index+1:]...)
+}
